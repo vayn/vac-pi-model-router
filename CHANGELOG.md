@@ -2,6 +2,18 @@
 
 Notable changes, newest first.
 
+## v0.12.1
+
+- **Free models are preferred within each tier.** Free models sort ahead of paid ones, and
+  the order inside each group is preserved. The pool stays the human-readable capability
+  order; only the candidate order changes.
+- Free status comes from data, not from naming. Two sources are combined: a pricing table
+  (`pricing.file`, entries with `rate: 0`) and an explicit list (`pricing.freeModels`).
+  Both empty means nothing is known to be free and the pool order is used as written.
+  `MODEL_ROUTER_PRICING` overrides the pricing table path.
+- The pricing cache is keyed by the data source, not only by time, so removing or changing
+  the pricing table takes effect immediately instead of lingering for a TTL window.
+
 ## v0.12.0
 
 - **Saturating classifier**: match counts are normalized per dimension (`n/(n+k)`) instead of

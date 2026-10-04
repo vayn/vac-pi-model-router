@@ -159,6 +159,8 @@ objects are replaced shallowly — provide the full object when overriding.
 | `mode` | `"active"` | `active` = switch, `shadow` = record only |
 | `pool` | placeholders | `<provider>/<modelId>` lists per tier; **order = priority** (anchor first) |
 | `timeGate.model` | `""` | Model id gated to `startHour`–`endHour`; empty = disabled |
+| `pricing.file` | `""` | Pricing table (`{model, channel, rate}`); `rate: 0` = free. Empty = feature off, pool order used as written |
+| `pricing.freeModels` | `[]` | Explicit free-model ids, for deployments without a pricing table |
 | `health.url` | `""` | Gateway `/status` endpoint; empty = probe disabled (fail-open) |
 | `health.timeoutMs` / `ttlSec` | `600` / `60` | Probe timeout / cache TTL |
 | `channels` | `["your-provider"]` | Channel names matching pool entry prefixes and `/status` `accounts` keys |
@@ -175,6 +177,7 @@ objects are replaced shallowly — provide the full object when overriding.
 |---|---|
 | `PI_CODING_AGENT_DIR` | Agent dir (config discovery) — defaults to `~/.pi/agent` |
 | `MODEL_ROUTER_STATE_DIR` | State/log dir — defaults to `~/.local/state/model-router` |
+| `MODEL_ROUTER_PRICING` | Overrides `pricing.file` (useful for migration and isolated tests) |
 | `MODEL_ROUTER_GATEWAY_CONFIG` | Path to a JSON file containing `api_key` for the health probe (credentials are never read unless set, and never written anywhere) |
 
 ## Commands

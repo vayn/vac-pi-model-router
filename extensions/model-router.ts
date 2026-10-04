@@ -61,6 +61,8 @@ const LOG_MAX_BYTES = 8 * 1024 * 1024;
 // 健康探测用的网关鉴权配置（JSON 含 api_key）——经环境变量注入，代码不内置本机路径。
 const GATEWAY_CONFIG = process.env.MODEL_ROUTER_GATEWAY_CONFIG ?? "";
 
+
+
 const DEFAULTS = {
   enabled: true,
   // active = 自动挡真实切换；shadow = 只记录推演（回退行为）
@@ -81,210 +83,51 @@ const DEFAULTS = {
   // 不可达/401 时 fail-open（健康闸自动失效，不影响路由）。
   // 期望响应形：{ "accounts": { "<channel>": [{ "cooling": bool, "disabled": bool }] } }
   health: { url: "", timeoutMs: 600, ttlSec: 60 },
-  // 健康探测涉及的通道名（与池项第一段、/status accounts 的键一致）
-  channels: ["your-provider"],
-  promptPreviewChars: 300,
-  // failover/轮转：模型级失败后的冷却与回退语义（primary/fallback 仅作 /router status
-  // 展示语义，实际轮转按「池序后继」执行）
-  failover: {
-    enabled: true,
-    primary: "your-provider/balanced-model",
-    fallback: "your-provider/balanced-backup",
-    cooldownSec: 300, // 模型失败后冷却时长（防双模型循环）
-  },
-  // 泳道偏好：档内新选模型时的优先候选（in_tier_hold 优先级更高；general 泳道不偏好）
-  lanePref: { code: [], knowledge: [] },
-  // Phase 3 ① mid-thread 升档——回合内连续工具失败 ≥ 阈值 ⇒ 任务实为 hard（起点分类误判），升 1 级
-  midThread: { enabled: true, failThreshold: 3, cooldownSec: 60 },
-  // Phase 3 ② 子代理自动分档——subagent 工具按 task 文本独立分档注入 model（显式 model 不覆盖）
-  subagentTier: { enabled: true },
-  // 模型级错误反馈（限流/不可用短窗冷却）；6004 类错误解析文案中的重置时刻（有则对齐到重置点）
-  errorFeedback: {
-    enabled: true,
-    rateLimitCooldownSec: 180,
-    usageWindowMaxSec: 12 * 3600,
-    unavailableCooldownSec: 600, // 上游模型不可用短冷却，仅护轮转与同回合重发
-    // 健康闸第三级：近期错误反馈感知——冷却态之外的「频次」维度。
-    // 动因：error-state 只存当前窗口（过期记录被丢弃），反复限流但窗口短的模型完全不可见。
-    recentErrorWindowSec: 3600, // 统计窗口（默认近 1 小时）
-    recentErrorMinSamples: 3, // 窗口内至少 N 个样本才启用降权（防小样本噪声）
-    recentErrorRateThreshold: 0.34, // 错误率超此值 ⇒ 该模型近期不健康
-  },
-  // 首选模型 provider 回退：ctx.model 为空（如首消息前）时的兜底，填你的 provider 名
-  defaultProvider: "",
-};
+// 缓存按「数据源指纹」分键：配置或文件变化时立即失效，避免 5 分钟 TTL 内沿用旧判定
+// （例如定价表被删除后若仍用缓存，会把已转付费的模型继续当免费）。
+let pricingCache: { key: string; at: number; free: Set<string> } | null = null;
 
-type Tier = keyof typeof DEFAULTS.pool;
-type Cfg = typeof DEFAULTS & { pool: Record<Tier, string[]> };
+/** 免费模型集合 ＝ 定价表（rate=0）∪ 显式免费清单。数据源缺失 ⇒ 空集 ⇒ 上层返回原序。 */
+function freeSet(c: Cfg): Set<string> {
+  // ① 显式清单（无定价表部署的主要形式）
+  const list = c.pricing?.freeModels ?? [];
 
-function loadConfig(): Cfg {
-  let user: Record<string, unknown> = {};
-  try {
-    user = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
-  } catch {
-    /* 无覆盖配置 → 默认 */
+  // ② 定价表（rate=0 ⇒ 免费）；环境变量优先级高于配置文件路径
+  const file = process.env.MODEL_ROUTER_PRICING || c.pricing?.file || "";
+
+  const key = JSON.stringify([list, file]);
+  const now = Date.now();
+  if (pricingCache && pricingCache.key === key && now - pricingCache.at < PRICING_TTL_MS) {
+    return pricingCache.free;
   }
-  const merged = { ...DEFAULTS, ...user } as Cfg;
-  merged.pool = { ...DEFAULTS.pool, ...(user.pool ?? {}) } as Cfg["pool"];
-  merged.health = { ...DEFAULTS.health, ...(user.health ?? {}) };
-  merged.timeGate = { ...DEFAULTS.timeGate, ...(user.timeGate ?? {}) };
-  merged.failover = { ...DEFAULTS.failover, ...(user.failover ?? {}) };
-  return merged;
-}
+  const free = new Set<string>();
+  for (const m of list) if (typeof m === "string" && m) free.add(m);
 
-// ---------- 会话级状态 ----------
-
-let cfg: Cfg = loadConfig();
-let gear: "auto" | "manual" = "auto";
-let manualModel: string | null = null;
-let segmentSeq = 0;
-let segmentReason = "unknown";
-let firstOfSegment = true;
-let promptedOnce = false;
-// router 自动切换的防误判标志（setModel 会同步 emit model_select）
-let routerSwitching = false;
-let lastRouterSwitchAt = 0;
-// 健康探测缓存
-let healthCache: { at: number; data: HealthResult } | null = null;
-
-// ---------- Rule-based tier classifier (v1: saturating normalization) ----------
-//
-// v0 → v1 rationale:
-//   1. Raw match counts replaced by saturating counts: one keyword appearing N times
-//      does not make a prompt N times harder (measured v0 score spanned -4..15, unbounded).
-//   2. Score normalized so thresholds are relative and comparable across corpora,
-//      which lets them be calibrated from recorded outcome data.
-//   3. The v0 tier decision boundaries are preserved (see classify), so tier
-//      distribution stays comparable across versions.
-//
-// Deliberately NOT adopted: system-prompt contribution and multi-turn context
-// blending. Those need gateway-level access to the full request body; an agent
-// extension only receives the prompt text, so copying them would be dead weight.
-
-const HARD = /架构|根因|深入|调研|权衡|性能|排查|迁移|系统性|容量|并发|安全|设计(方案|评审)|基准|A\/B|benchmark|architecture|root cause|investigat|trade-?off|deep dive/gi;
-const AGENTIC = /修复|实现|重构|部署|提交|调试|改(造|写)|编写|集成|回滚|排查(不了)?|fix|implement|refactor|debug|deploy|migrat(?!ion)|测试用例|写(个|一个)(脚本|工具)|删除(文件|目录)/gi;
-const EASY = /是什么|什么是|列(出|一下)|翻译|格式化|重命名|总结|摘要|查一下|解释(一下)?|快速|多少钱|几点|what is|define|quickly|tl;?dr/gi;
-// P2-3 泳道信号（与分档 score 正交：不改档，只决定档内偏好）
-// Saturating count: n matches -> n/(n+k). n=0 gives 0, n=k gives 0.5, approaching 1.
-// k is smallest for HARD (1) because it is the only signal that can push the
-// Performance tier on its own, so it is the one most worth protecting from repetition.
-const SAT_HARD = 1, SAT_AGENTIC = 3, SAT_EASY = 2;
-// Dimension weights. Positive weights are a budget; EASY is a penalty outside it.
-const W_HARD = 0.6, W_AGENTIC = 0.4, W_EASY = 0.20;
-// Code fences and length bands are WEAK evidence folded into the agentic dimension
-// (a long prompt is not by itself a hard prompt).
-const LENGTH_BAND_MAX = 0.5;
-// Normalized thresholds. perf requires HARD plus some corroborating evidence,
-// mirroring v0's conservatism where a single keyword was never enough.
-const TH_PERF = 0.40, TH_BALANCED = 0.15, TH_FAST_MIN = -0.20;
-const TH_CONF_HIGH_PERF = 0.45, TH_CONF_HIGH_FAST = -0.15;
-
-/** Classifier version tag, recorded per decision so calibration never mixes versions. */
-export const CLASSIFIER_VERSION = "v1-saturating";
-
-/** Saturating count: n matches -> n/(n+k). */
-function sat(n: number, k: number): number {
-  return n / (n + k);
-}
-
-const LANE_CODE = /代码|函数|脚本|修复|实现|重构|调试|编译|报错|bug|接口|\bapi\b|正则|sql|python|typescript|javascript|bash|终端|命令行|部署|测试|算法|数据结构/gi;
-const LANE_KNOWLEDGE = /是什么|什么是|为什么|区别|比较|对比|原理|概念|定义|历史|背景|论文|文献|解释|知识|评测|科普|指南|教程/gi;
-
-function classify(prompt: string) {
-  const chars = [...prompt].length;
-  const hard = (prompt.match(HARD) ?? []).length;
-  const agentic = (prompt.match(AGENTIC) ?? []).length;
-  const easy = (prompt.match(EASY) ?? []).length;
-  const codeBlock = prompt.includes("```");
-  const lengthBand = chars >= 4000 ? 2 : chars >= 1000 ? 1 : 0;
-
-  // Saturating normalization: each dimension is n/(n+k) first, then weighted.
-  const sh = sat(hard, SAT_HARD);
-  const sa = sat(agentic, SAT_AGENTIC);
-  const se = sat(easy, SAT_EASY);
-  const agenticBoost = Math.min(
-    1,
-    sa + (codeBlock ? LENGTH_BAND_MAX : 0) + (lengthBand / 2) * LENGTH_BAND_MAX,
-  );
-  const score = W_HARD * sh + W_AGENTIC * agenticBoost - W_EASY * se;
-
-  // 保守优先：歧义一律 Balanced（避免 fast-only 失败模式）
-  let tier: Tier = "Balanced";
-  let rule = "default_balanced";
-  if (hard >= 1 && score >= TH_PERF) {
-    tier = "Performance";
-    rule = "perf_hard";
-  } else if (easy >= 1 && agentic === 0 && hard === 0 && chars < 600) {
-    tier = "Fast";
-    rule = "fast_easy";
-  } else if (score >= TH_BALANCED) {
-    tier = "Balanced";
-    rule = "balanced_score";
+  if (file) {
+    try {
+      const raw = JSON.parse(readFileSync(file, "utf8"));
+      const rows: unknown[] = Array.isArray(raw) ? raw : (raw?.models ?? []);
+      for (const r of rows) {
+        const row = r as { model?: unknown; channel?: unknown; rate?: unknown };
+        if (typeof row.model !== "string") continue;
+        if (row.rate === 0) free.add(`${String(row.channel ?? "")}/${row.model}`);
+      }
+    } catch {
+      /* 读失败 ⇒ 仅保留显式清单；绝不阻断会话 */
+    }
   }
-  const confidence =
-    (tier === "Performance" && score >= TH_CONF_HIGH_PERF) ||
-    (tier === "Fast" && score <= TH_CONF_HIGH_FAST)
-      ? "high"
-      : "low";
 
-  // classified=false means no signal matched, so the tier came from the conservative
-  // fallback rather than a judgement. Recorded so logs can distinguish "judged Balanced"
-  // from "no signal, defaulted to Balanced".
-  const classified = hard > 0 || agentic > 0 || easy > 0 || codeBlock || lengthBand > 0;
-
-  // P2-3 泳道判定：两类信号均 ≥2 且严格占优才归类，否则 general（保守）
-  const codeLane = (prompt.match(LANE_CODE) ?? []).length;
-  const knowledgeLane = (prompt.match(LANE_KNOWLEDGE) ?? []).length;
-  const lane =
-    codeLane >= 2 && codeLane > knowledgeLane
-      ? "code"
-      : knowledgeLane >= 2 && knowledgeLane > codeLane
-        ? "knowledge"
-        : "general";
-
-  return {
-    signals: { hard, agentic, easy, codeBlock, lengthBand, chars },
-    score,
-    rule,
-    tier,
-    classified,
-    scoreBreakdown: { hard: sh, agentic: agenticBoost, easy: se },
-    confidence,
-    lane,
-    laneSignals: { codeLane, knowledgeLane },
-  };
+  pricingCache = { key, at: now, free };
+  return free;
 }
 
-// ---------- 时段 gate ----------
-
-function isNight(hour: number, gate: Cfg["timeGate"]) {
-  return hour >= gate.startHour || hour < gate.endHour;
+function freeFirst(models: string[], c: Cfg): string[] {
+  const free = freeSet(c);
+  if (free.size === 0) return models; // 判不出免费 ⇒ 保持池内原序（fail-open）
+  const head = models.filter((m) => free.has(m));
+  const tail = models.filter((m) => !free.has(m));
+  return [...head, ...tail];
 }
-
-// ---------- 渠道健康闸 ----------
-
-interface HealthResult {
-  status: "ok" | "http_error" | "unknown";
-  err?: string;
-  channels: Record<string, boolean>;
-}
-
-// 模型解析：优先按 provider 精确查（单 provider/网关式布局）；
-// 回退到全注册表按 `provider/model` 或裸 id 匹配（多 provider 布局）。
-// 找不到返回 undefined ⇒ 上层落 decision=model_not_found，不阻断会话。
-function resolveModel(
-  registry: { find(provider: string, id: string): unknown; getAll(): unknown[] },
-  provider: string | undefined,
-  id: string,
-) {
-  if (provider) {
-    const hit = registry.find(provider, id);
-    if (hit) return hit;
-  }
-  const all = registry.getAll() as Array<{ provider: string; id: string }>;
-  return all.find((x) => `${x.provider}/${x.id}` === id) ?? all.find((x) => x.id === id);
-}
-
 function channelOf(modelId: string) {
   return modelId.split("/")[0] ?? "";
 }
@@ -592,7 +435,8 @@ const TIER_DESCENT: Tier[] = ["Performance", "Balanced", "Fast"];
 
 function candidatesFor(tier: Tier, night: boolean, c: Cfg): string[] {
   // Performance 池若被时段闸剔空 → decide() 自然级联降档 Balanced（级联兜底）
-  return c.pool[tier];
+  // Free models first within a tier; order within each group is preserved.
+  return freeFirst(c.pool[tier], c);
 }
 
 async function decide(
