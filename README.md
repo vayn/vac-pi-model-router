@@ -54,11 +54,6 @@ Gate ③ deserves a note: it **de-prioritizes** (moves a recently error-prone mo
 viable list) instead of removing it — "recently flaky" ≠ "currently unavailable", and hard removal
 can collapse a sparse pool into `no_viable`.
 
-### Execution-time adaptation (Phase 3)
-
-- **Mid-thread upgrade** — three *consecutive* tool failures inside one turn mean the prompt was
-  misclassified as easy; the router upgrades one tier (max once per turn, with cooldown). One
-  success resets the streak: consecutive failures are the difficulty signal, sporadic ones are noise.
 ### How classification works
 
 The classifier is a saturating, weighted rule scorer. Each dimension is normalized as
@@ -80,6 +75,12 @@ tell "judged Balanced" from "no signal matched, defaulted to Balanced", and see 
 dimension drove a tier. `clsVersion` is stamped too, which matters for calibration: scores
 from different classifier versions live on different scales and must never be pooled.
 
+
+### Execution-time adaptation (Phase 3)
+
+- **Mid-thread upgrade** — three *consecutive* tool failures inside one turn mean the prompt was
+  misclassified as easy; the router upgrades one tier (max once per turn, with cooldown). One
+  success resets the streak: consecutive failures are the difficulty signal, sporadic ones are noise.
 - **Sub-agent tiering** — the `subagent` tool's task is classified independently and the tier's
   anchor model is injected into `input.model`. An explicitly specified model is never overridden.
 - **Same-turn requeue** — when a model-level rate limit hits and rotation succeeded within the

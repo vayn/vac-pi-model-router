@@ -51,6 +51,24 @@ classify()  ── 规则分层分类器：Fast / Balanced / Performance
 健康闸 ③ 值得说明：它对近期易错模型是**降权**（挪到可行列表末尾）而非剔除 ——
 「近期常错」不等于「当前不可用」，硬剔除会把稀疏的候选池逼向 `no_viable`。
 
+### 分类器如何工作
+
+分类器是**饱和加权规则打分**。每个维度先按 `n/(n+k)` 归一化再加权，因此重复关键词**不会**放大分数：
+
+| 维度 | 饱和点 `k` | 权重 | 说明 |
+|---|---|---|---|
+| `HARD`（架构、根因、权衡、安全…）| 1 | 0.60 | 唯一能单独进入 `Performance` 的信号 |
+| `AGENTIC`（修复、重构、部署、调试…）| 3 | 0.40 | 代码围栏与长 prompt 作为弱证据并入（≤0.5）|
+| `EASY`（什么是、翻译、定义…）| 2 | 0.20 | 惩罚项，刻意不计入正向权重预算 |
+
+档位切分：`score >= 0.40 → Performance`，`>= 0.15 → Balanced`，否则 `Fast`；短 prompt 走
+`EASY` 专用快速通道。`Performance` 仍要求 `HARD` **叠加**其它证据 —— 单个关键词永不单独进档，
+这与分类器一贯的保守行为一致。
+
+每条决策行在分数之外还记录 `classified` 与 `scoreBreakdown`，因此可以区分「判定为 Balanced」
+与「无信号匹配、兜底为 Balanced」，并看出是哪个维度决定了档位。同时写入 `clsVersion`，
+这对校准很重要：不同分类器版本的分数不在同一尺度上，**绝不可混算**。
+
 ### 执行期自适应（Phase 3）
 
 - **mid-thread 升档** —— 同一回合内三次**连续**工具失败，说明该 prompt 被低估为简单；路由器
@@ -129,6 +147,8 @@ pi install ~/pi-packages/model-router
 | `mode` | `"active"` | `active` = 切换；`shadow` = 只记录 |
 | `pool` | 占位符 | 每档 `<provider>/<modelId>` 列表；**次序即优先级**（锚位在前）|
 | `timeGate.model` | `""` | 仅 `startHour`–`endHour` 可选的模型；空 = 关闭 |
+| `pricing.file` | `""` | 定价表（`{model, channel, rate}`）；`rate: 0` 即免费。空 = 关闭该特性，按池内原序 |
+| `pricing.freeModels` | `[]` | 显式免费模型清单，用于没有定价表的部署 |
 | `health.url` | `""` | 网关 `/status` 端点；空 = 不探测（fail-open）|
 | `health.timeoutMs` / `ttlSec` | `600` / `60` | 探测超时 / 缓存 TTL |
 | `channels` | `["your-provider"]` | 通道名，需与池项前缀及 `/status` 的 `accounts` 键一致 |
@@ -145,6 +165,7 @@ pi install ~/pi-packages/model-router
 |---|---|
 | `PI_CODING_AGENT_DIR` | agent 目录（配置发现）—— 默认 `~/.pi/agent` |
 | `MODEL_ROUTER_STATE_DIR` | 状态/日志目录 —— 默认 `~/.local/state/model-router` |
+| `MODEL_ROUTER_PRICING` | 覆盖 `pricing.file`（便于迁移与隔离测试）|
 | `MODEL_ROUTER_GATEWAY_CONFIG` | 含 `api_key` 的健康探测配置 JSON 路径（未设置则不读取任何凭据，且凭据绝不写入任何地方）|
 
 ## 命令
