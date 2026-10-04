@@ -1,7 +1,6 @@
 # Changelog
 
-Notable changes, newest first. History before the initial public release is summarized
-from the internal development log; details live in git history.
+Notable changes, newest first.
 
 ## v0.12.0
 

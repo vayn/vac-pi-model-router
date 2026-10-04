@@ -147,12 +147,46 @@ let lastRouterSwitchAt = 0;
 // 健康探测缓存
 let healthCache: { at: number; data: HealthResult } | null = null;
 
-// ---------- 规则分层分类器（v0 先验，Phase 2 用 outcome 数据校准） ----------
+// ---------- Rule-based tier classifier (v1: saturating normalization) ----------
+//
+// v0 → v1 rationale:
+//   1. Raw match counts replaced by saturating counts: one keyword appearing N times
+//      does not make a prompt N times harder (measured v0 score spanned -4..15, unbounded).
+//   2. Score normalized so thresholds are relative and comparable across corpora,
+//      which lets them be calibrated from recorded outcome data.
+//   3. The v0 tier decision boundaries are preserved (see classify), so tier
+//      distribution stays comparable across versions.
+//
+// Deliberately NOT adopted: system-prompt contribution and multi-turn context
+// blending. Those need gateway-level access to the full request body; an agent
+// extension only receives the prompt text, so copying them would be dead weight.
 
 const HARD = /架构|根因|深入|调研|权衡|性能|排查|迁移|系统性|容量|并发|安全|设计(方案|评审)|基准|A\/B|benchmark|architecture|root cause|investigat|trade-?off|deep dive/gi;
 const AGENTIC = /修复|实现|重构|部署|提交|调试|改(造|写)|编写|集成|回滚|排查(不了)?|fix|implement|refactor|debug|deploy|migrat(?!ion)|测试用例|写(个|一个)(脚本|工具)|删除(文件|目录)/gi;
 const EASY = /是什么|什么是|列(出|一下)|翻译|格式化|重命名|总结|摘要|查一下|解释(一下)?|快速|多少钱|几点|what is|define|quickly|tl;?dr/gi;
 // P2-3 泳道信号（与分档 score 正交：不改档，只决定档内偏好）
+// Saturating count: n matches -> n/(n+k). n=0 gives 0, n=k gives 0.5, approaching 1.
+// k is smallest for HARD (1) because it is the only signal that can push the
+// Performance tier on its own, so it is the one most worth protecting from repetition.
+const SAT_HARD = 1, SAT_AGENTIC = 3, SAT_EASY = 2;
+// Dimension weights. Positive weights are a budget; EASY is a penalty outside it.
+const W_HARD = 0.6, W_AGENTIC = 0.4, W_EASY = 0.20;
+// Code fences and length bands are WEAK evidence folded into the agentic dimension
+// (a long prompt is not by itself a hard prompt).
+const LENGTH_BAND_MAX = 0.5;
+// Normalized thresholds. perf requires HARD plus some corroborating evidence,
+// mirroring v0's conservatism where a single keyword was never enough.
+const TH_PERF = 0.40, TH_BALANCED = 0.15, TH_FAST_MIN = -0.20;
+const TH_CONF_HIGH_PERF = 0.45, TH_CONF_HIGH_FAST = -0.15;
+
+/** Classifier version tag, recorded per decision so calibration never mixes versions. */
+export const CLASSIFIER_VERSION = "v1-saturating";
+
+/** Saturating count: n matches -> n/(n+k). */
+function sat(n: number, k: number): number {
+  return n / (n + k);
+}
+
 const LANE_CODE = /代码|函数|脚本|修复|实现|重构|调试|编译|报错|bug|接口|\bapi\b|正则|sql|python|typescript|javascript|bash|终端|命令行|部署|测试|算法|数据结构/gi;
 const LANE_KNOWLEDGE = /是什么|什么是|为什么|区别|比较|对比|原理|概念|定义|历史|背景|论文|文献|解释|知识|评测|科普|指南|教程/gi;
 
@@ -163,23 +197,40 @@ function classify(prompt: string) {
   const easy = (prompt.match(EASY) ?? []).length;
   const codeBlock = prompt.includes("```");
   const lengthBand = chars >= 4000 ? 2 : chars >= 1000 ? 1 : 0;
-  const score = hard * 2 + agentic + codeBlock + lengthBand - easy * 2;
+
+  // Saturating normalization: each dimension is n/(n+k) first, then weighted.
+  const sh = sat(hard, SAT_HARD);
+  const sa = sat(agentic, SAT_AGENTIC);
+  const se = sat(easy, SAT_EASY);
+  const agenticBoost = Math.min(
+    1,
+    sa + (codeBlock ? LENGTH_BAND_MAX : 0) + (lengthBand / 2) * LENGTH_BAND_MAX,
+  );
+  const score = W_HARD * sh + W_AGENTIC * agenticBoost - W_EASY * se;
 
   // 保守优先：歧义一律 Balanced（避免 fast-only 失败模式）
   let tier: Tier = "Balanced";
   let rule = "default_balanced";
-  if (hard >= 1 && score >= 3) {
+  if (hard >= 1 && score >= TH_PERF) {
     tier = "Performance";
     rule = "perf_hard";
   } else if (easy >= 1 && agentic === 0 && hard === 0 && chars < 600) {
     tier = "Fast";
     rule = "fast_easy";
-  } else if (score >= 1) {
+  } else if (score >= TH_BALANCED) {
     tier = "Balanced";
     rule = "balanced_score";
   }
   const confidence =
-    (tier === "Performance" && score >= 4) || (tier === "Fast" && score <= -4) ? "high" : "low";
+    (tier === "Performance" && score >= TH_CONF_HIGH_PERF) ||
+    (tier === "Fast" && score <= TH_CONF_HIGH_FAST)
+      ? "high"
+      : "low";
+
+  // classified=false means no signal matched, so the tier came from the conservative
+  // fallback rather than a judgement. Recorded so logs can distinguish "judged Balanced"
+  // from "no signal, defaulted to Balanced".
+  const classified = hard > 0 || agentic > 0 || easy > 0 || codeBlock || lengthBand > 0;
 
   // P2-3 泳道判定：两类信号均 ≥2 且严格占优才归类，否则 general（保守）
   const codeLane = (prompt.match(LANE_CODE) ?? []).length;
@@ -196,6 +247,8 @@ function classify(prompt: string) {
     score,
     rule,
     tier,
+    classified,
+    scoreBreakdown: { hard: sh, agentic: agenticBoost, easy: se },
     confidence,
     lane,
     laneSignals: { codeLane, knowledgeLane },
@@ -813,6 +866,7 @@ export default function (pi: ExtensionAPI) {
         toolCount: event.systemPromptOptions?.selectedTools?.length ?? 0,
         hour,
         ...cls,
+        clsVersion: CLASSIFIER_VERSION,
         promptPreview: [...event.prompt].slice(0, cfg.promptPreviewChars).join(""),
       };
 
