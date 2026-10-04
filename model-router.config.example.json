@@ -1,0 +1,32 @@
+{
+  "enabled": true,
+  "mode": "active",
+  "pool": {
+    "Fast": ["your-provider/fast-model", "your-provider/cheap-backup"],
+    "Balanced": ["your-provider/balanced-model", "your-provider/balanced-backup"],
+    "Performance": ["your-provider/strong-model"]
+  },
+  "timeGate": { "model": "", "startHour": 23, "endHour": 8 },
+  "health": { "url": "", "timeoutMs": 600, "ttlSec": 60 },
+  "channels": ["your-provider"],
+  "failover": {
+    "enabled": true,
+    "primary": "your-provider/balanced-model",
+    "fallback": "your-provider/balanced-backup",
+    "cooldownSec": 300
+  },
+  "lanePref": { "code": [], "knowledge": [] },
+  "midThread": { "enabled": true, "failThreshold": 3, "cooldownSec": 60 },
+  "subagentTier": { "enabled": true },
+  "errorFeedback": {
+    "enabled": true,
+    "rateLimitCooldownSec": 180,
+    "usageWindowMaxSec": 43200,
+    "unavailableCooldownSec": 600,
+    "recentErrorWindowSec": 3600,
+    "recentErrorMinSamples": 3,
+    "recentErrorRateThreshold": 0.34
+  },
+  "defaultProvider": "",
+  "promptPreviewChars": 300
+}

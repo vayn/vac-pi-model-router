@@ -1,0 +1,14 @@
+# 运行期状态与日志（部署后可能出现在工作区，禁止入库）
+state/
+*.log
+*.log.1
+error-state.json
+failover-state.json
+
+# 依赖与构建
+node_modules/
+*.tsbuildinfo
+
+# 本机配置与凭据（config 可能含网关地址，凭据绝不入库）
+model-router.config.json
+*.env

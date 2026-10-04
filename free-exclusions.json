@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "note": "model-router 免费模型排除表（模板）。契约：若你的网关声明了免费模型（如 /api/fees 中 free=true 且 rate=0），每个免费模型要么出现在候选池，要么出现在本表并附排除依据——两者皆无即视为维护遗漏（可据此做门禁断言）。排除理由分两类：『上游不可用』= 实测持续失败（附证据与时间）；『人为排除』= 上游可用但维护者决定不用（本表同时是排除记录）。条目形：\"<provider>/<model>\": { \"reason\": \"...\", \"evidence\": \"...\", \"checkedAt\": \"YYYY-MM-DDTHH:mm+ZZZZ\" }",
+  "updatedAt": "",
+  "exclusions": {}
+}
