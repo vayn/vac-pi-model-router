@@ -4,6 +4,13 @@ Notable changes, newest first.
 
 ## v0.12.1
 
+- **Fix: restore the classifier and configuration sections.** The v0.12.1 sync replaced a
+  large span of the file with the free-model block, dropping `loadConfig`, the signal
+  regexes, the classifier constants, `sat()`, `classify()`, `isNight()` and `resolveModel()`.
+  The published file failed to parse and could not be loaded. Restored from the upstream
+  source and re-verified by transpile check, a statement-set comparison of the classifier
+  (equal), and an isolated end-to-end run.
+
 - **Free models are preferred within each tier.** Free models sort ahead of paid ones, and
   the order inside each group is preserved. The pool stays the human-readable capability
   order; only the candidate order changes.

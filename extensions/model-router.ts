@@ -83,6 +83,217 @@ const DEFAULTS = {
   // 不可达/401 时 fail-open（健康闸自动失效，不影响路由）。
   // 期望响应形：{ "accounts": { "<channel>": [{ "cooling": bool, "disabled": bool }] } }
   health: { url: "", timeoutMs: 600, ttlSec: 60 },
+  // 免费优先数据源：定价表 rate=0 ∪ 显式清单；留空即不启用，退化为池内原序。
+  pricing: {
+    file: "",
+    freeModels: [] as string[],
+  },
+  channels: ["your-provider"],
+  promptPreviewChars: 300,
+  // failover 名义对（仅作 /router status 展示语义，实际轮转按「池序后继」执行）
+  // v0.8.0：primary 跟随 Balanced 池锚位改为同模型免费渠道（实际轮转以池序为准，
+  //         primary/fallback 仅作 /router status 展示语义，保持与池序一致避免误读）
+  failover: {
+    enabled: true,
+    primary: "your-provider/balanced-model",
+    fallback: "your-provider/balanced-backup",
+    cooldownSec: 300, // 模型失败后冷却时长（防双模型循环）
+  },
+  // P2-3 泳道偏好：档内新选模型时优先可行候选（in_tier_hold 优先级更高；general 不偏好）
+  // v0.8.0：code 泳道同步优先免费渠道（同模型，能力位不变）；被限流时由可行过滤自然回落付费侧
+  lanePref: {
+    code: [],
+    knowledge: [],
+  },
+  // P2-1 错误反馈：模型级限流短窗冷却（/status 健康闸盲区补偿）；6004 解析文案中的重置时刻
+  // Phase 3 深化（v0.11.0，报告 §七）：
+  // ① mid-thread 升档——回合内连续工具失败 ≥ 阈值 ⇒ 任务实为 hard/agentic（起点分类误判），升 1 级
+  midThread: { enabled: true, failThreshold: 3, cooldownSec: 60 },
+  // ② 子代理自动分档——subagent 工具按 task 文本独立分档注入 model（显式 model 不覆盖）
+  subagentTier: { enabled: true },
+  errorFeedback: {
+    enabled: true,
+    rateLimitCooldownSec: 180,
+    usageWindowMaxSec: 12 * 3600,
+    unavailableCooldownSec: 600, // 上游模型不可用（Model is unavailable 等）短冷却，仅护轮转与 requeue
+    // Phase 3（v0.10.0）：近期错误反馈感知——冷却态之外的「频次」维度
+    // 动因：error-state 只存**当前窗口**（过期的记录被 loadErrorState 丢弃），
+    //   故模型反复限流、每次窗口短、窗口间隙又可选 ⇒ 健康闸完全看不见。
+    //   实测佐证：某模型限流记录已过期 2.3h，count 仍是 1 —— 仅凭冷却态无法反映历史频次。
+    recentErrorWindowSec: 3600, // 统计窗口（默认近 1 小时）
+    recentErrorMinSamples: 3,   // 窗口内至少 N 个样本才启用降权（防小样本噪声）
+    recentErrorRateThreshold: 0.34, // 错误率超此值 ⇒ 该模型近期不健康
+  },
+};
+
+type Tier = keyof typeof DEFAULTS.pool;
+type Cfg = typeof DEFAULTS & { pool: Record<Tier, string[]> };
+
+function loadConfig(): Cfg {
+  let user: Record<string, unknown> = {};
+  try {
+    user = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+  } catch {
+    /* 无覆盖配置 → 默认 */
+  }
+  const merged = { ...DEFAULTS, ...user } as Cfg;
+  merged.pool = { ...DEFAULTS.pool, ...(user.pool ?? {}) } as Cfg["pool"];
+  merged.health = { ...DEFAULTS.health, ...(user.health ?? {}) };
+  merged.timeGate = { ...DEFAULTS.timeGate, ...(user.timeGate ?? {}) };
+  merged.failover = { ...DEFAULTS.failover, ...(user.failover ?? {}) };
+  merged.pricing = { ...DEFAULTS.pricing, ...(user.pricing ?? {}) } as Cfg["pricing"];
+  return merged;
+}
+
+// ---------- 会话级状态 ----------
+
+let cfg: Cfg = loadConfig();
+let gear: "auto" | "manual" = "auto";
+let manualModel: string | null = null;
+let segmentSeq = 0;
+let segmentReason = "unknown";
+let firstOfSegment = true;
+let promptedOnce = false;
+// router 自动切换的防误判标志（setModel 会同步 emit model_select）
+let routerSwitching = false;
+let lastRouterSwitchAt = 0;
+// 健康探测缓存
+let healthCache: { at: number; data: HealthResult } | null = null;
+
+// ---------- 规则分层分类器（v1：饱和归一化；校准真源 = router_calibrate.py 的 outcome） ----------
+//
+// v0 → v1 的变更依据（对标 bifrost plugins/routing/complexity 的成熟形态）：
+//   ① 裸计数改饱和计数：同一信号出现 N 次不代表难度翻 N 倍（实测旧 score 跨 -4~15，无界）。
+//   ② score 归一化到 [0,1]（可含负），阈值改相对值 → 可跨语料比较、可被 outcome 校准。
+//   ③ 保留 v0 的分档决策边界语义（见 classify 内注释），使新旧档位分布可比。
+// 不照搬项：system prompt 软贡献 / 多轮上下文 blending —— 那需要网关位置的 body 访问权，
+// pi 扩展只有单条 prompt 文本，抄了也无法实现（KISS）。
+
+const HARD = /架构|根因|深入|调研|权衡|性能|排查|迁移|系统性|容量|并发|安全|设计(方案|评审)|基准|A\/B|benchmark|architecture|root cause|investigat|trade-?off|deep dive/gi;
+const AGENTIC = /修复|实现|重构|部署|提交|调试|改(造|写)|编写|集成|回滚|排查(不了)?|fix|implement|refactor|debug|deploy|migrat(?!ion)|测试用例|写(个|一个)(脚本|工具)|删除(文件|目录)/gi;
+const EASY = /是什么|什么是|列(出|一下)|翻译|格式化|重命名|总结|摘要|查一下|解释(一下)?|快速|多少钱|几点|what is|define|quickly|tl;?dr/gi;
+
+// 饱和点 k：命中该次数即视为该维度信号过半（n/(n+k)=0.5）。HARD 收得最紧（2）——
+// 它是唯一能直推 Performance 的信号，最需抗刷分。
+const SAT_HARD = 1, SAT_AGENTIC = 3, SAT_EASY = 2;
+// 维度权重（正向合计 1.00；EASY 为惩罚项，刻意不计入该预算）。
+const W_HARD = 0.6, W_AGENTIC = 0.4, W_EASY = 0.20;
+// 长度带/codeBlock 作为**弱**证据并入 agentic 维度（长 prompt 本身不构成难度）。
+const LENGTH_BAND_MAX = 0.5;
+/** 分类器版本标识：写入每条决策日志，供 outcome 校准按版本分组（禁跨版本混算）。 */
+export const CLASSIFIER_VERSION = "v1-saturating";
+
+// 归一化阈值（v0 决策边界的等价换算：旧 score>=3 ≈ 0.5；>=1 ≈ 0.25）。
+const TH_PERF = 0.40, TH_BALANCED = 0.15, TH_FAST_MIN = -0.20;
+const TH_CONF_HIGH_PERF = 0.45, TH_CONF_HIGH_FAST = -0.15;
+
+/** 饱和计数：n 次命中 → n/(n+k)（n=0 为 0，k 次为 0.5，趋近 1）。 */
+function sat(n: number, k: number): number {
+  return n / (n + k);
+}
+// P2-3 泳道信号（与分档 score 正交：不改档，只决定档内偏好）
+const LANE_CODE = /代码|函数|脚本|修复|实现|重构|调试|编译|报错|bug|接口|\bapi\b|正则|sql|python|typescript|javascript|bash|终端|命令行|部署|测试|算法|数据结构/gi;
+const LANE_KNOWLEDGE = /是什么|什么是|为什么|区别|比较|对比|原理|概念|定义|历史|背景|论文|文献|解释|知识|评测|科普|指南|教程/gi;
+
+function classify(prompt: string) {
+  const chars = [...prompt].length;
+  const hard = (prompt.match(HARD) ?? []).length;
+  const agentic = (prompt.match(AGENTIC) ?? []).length;
+  const easy = (prompt.match(EASY) ?? []).length;
+  const codeBlock = prompt.includes("```");
+  const lengthBand = chars >= 4000 ? 2 : chars >= 1000 ? 1 : 0;
+
+  // 饱和归一化：每维度先 n/(n+k) 再按权重合成（线性，无隐藏耦合）。
+  const sh = sat(hard, SAT_HARD);
+  const sa = sat(agentic, SAT_AGENTIC);
+  const se = sat(easy, SAT_EASY);
+  // codeBlock 与长度带是弱证据（各自 ≤ LENGTH_BAND_MAX），并入 agentic 维度
+  const agenticBoost = Math.min(
+    1,
+    sa + (codeBlock ? LENGTH_BAND_MAX : 0) + (lengthBand / 2) * LENGTH_BAND_MAX,
+  );
+  const score = W_HARD * sh + W_AGENTIC * agenticBoost - W_EASY * se;
+
+  // 保守优先：歧义一律 Balanced（避免 fast-only 失败模式）
+  let tier: Tier = "Balanced";
+  let rule = "default_balanced";
+  if (hard >= 1 && score >= TH_PERF) {
+    tier = "Performance";
+    rule = "perf_hard";
+  } else if (easy >= 1 && agentic === 0 && hard === 0 && chars < 600) {
+    tier = "Fast";
+    rule = "fast_easy";
+  } else if (score >= TH_BALANCED) {
+    tier = "Balanced";
+    rule = "balanced_score";
+  }
+  const confidence =
+    (tier === "Performance" && score >= TH_CONF_HIGH_PERF) ||
+    (tier === "Fast" && score <= TH_CONF_HIGH_FAST)
+      ? "high"
+      : "low";
+
+  // classified=false 表示本条 prompt 未命中任何信号 → 档位来自保守兜底而非判定（
+  // 对标 bifrost 的「无信号 → unknown → 保持原路径，不猜」；此处不拒绝路由，只做标注，
+  // 使 decision-log 能区分「判定为 Balanced」与「无信号兜底 Balanced」）。
+  const classified = hard > 0 || agentic > 0 || easy > 0 || codeBlock || lengthBand > 0;
+
+  // P2-3 泳道判定：两类信号均 ≥2 且严格占优才归类，否则 general（保守）
+  const codeLane = (prompt.match(LANE_CODE) ?? []).length;
+  const knowledgeLane = (prompt.match(LANE_KNOWLEDGE) ?? []).length;
+  const lane =
+    codeLane >= 2 && codeLane > knowledgeLane
+      ? "code"
+      : knowledgeLane >= 2 && knowledgeLane > codeLane
+        ? "knowledge"
+        : "general";
+
+  return {
+    signals: { hard, agentic, easy, codeBlock, lengthBand, chars },
+    score,
+    rule,
+    tier,
+    confidence,
+    classified,
+    // 分数构成：归一化分量（供 outcome 校准定位是哪一维在驱动档位）
+    scoreBreakdown: { hard: sh, agentic: agenticBoost, easy: se },
+    lane,
+    laneSignals: { codeLane, knowledgeLane },
+  };
+}
+
+// ---------- 时段 gate ----------
+
+function isNight(hour: number, gate: Cfg["timeGate"]) {
+  return hour >= gate.startHour || hour < gate.endHour;
+}
+
+// ---------- 渠道健康闸 ----------
+
+interface HealthResult {
+  status: "ok" | "http_error" | "unknown";
+  err?: string;
+  channels: Record<string, boolean>;
+}
+
+// 模型解析：优先按 provider 精确查；未命中则回退全注册表按 `provider/model` 或裸 id 匹配。
+// 必要性：池项均为 `<channel>/<model>` 形态，而 find(provider, id) 要求 provider 精确相等——
+// 会话若处在非池 provider（如手动挡锁到他人 provider），原先所有切换都会静默 miss
+// （before_agent_start 落 model_not_found，另两处直接 return），路由事实上瘫痪。
+// 兜底后：单 provider 网关布局行为不变，多 provider 布局亦可路由。
+function resolveModel(
+  registry: { find(provider: string, id: string): unknown; getAll(): unknown[] },
+  provider: string | undefined,
+  id: string,
+) {
+  if (provider) {
+    const hit = registry.find(provider, id);
+    if (hit) return hit;
+  }
+  const all = registry.getAll() as Array<{ provider: string; id: string }>;
+  return all.find((x) => `${x.provider}/${x.id}` === id) ?? all.find((x) => x.id === id);
+}
+
 // 缓存按「数据源指纹」分键：配置或文件变化时立即失效，避免 5 分钟 TTL 内沿用旧判定
 // （例如定价表被删除后若仍用缓存，会把已转付费的模型继续当免费）。
 let pricingCache: { key: string; at: number; free: Set<string> } | null = null;
