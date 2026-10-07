@@ -76,7 +76,7 @@ dimension drove a tier. `clsVersion` is stamped too, which matters for calibrati
 from different classifier versions live on different scales and must never be pooled.
 
 
-### Execution-time adaptation (Phase 3 & 4)
+### Execution-time adaptation (Phase 3–5)
 
 Two layers read the same signal — *consecutive* tool failures inside one turn — and run in
 order: try a stronger model first, and only give up when there is nothing left to try.
@@ -98,6 +98,25 @@ order: try a stronger model first, and only give up when there is nothing left t
   That entry is keyed by the **resolved** `provider/modelId`, not by the pool-entry form: if your
   pool lists `my-gateway/gpt-x` but pi resolves it under provider `myprovider`, the key is
   `myprovider/my-gateway/gpt-x`. Using the pool form as the key silently fails to match.
+- **Cost guard** — two rules that stop automatic switching from spending money silently. Free/paid
+  is decided by the **same** set `freeFirst` uses (pricing rows with `rate == 0` ∪ the explicit
+  `pricing.freeModels` list); a model missing from the table counts as **paid** (conservative).
+  - *Rule 1 — free first within the tier*: if the model about to be switched to is paid and the
+    **same tier has a usable free candidate** (not cooling, channel healthy), the router switches
+    to that free candidate instead. The tier was already chosen by the classifier, so a free peer
+    inside it costs nothing in capability — paying more for the same tier buys nothing. A very
+    short prompt (`shortPromptChars`) is the one exception, because its absolute cost is negligible
+    while a free model's cold-start or rate-limit delay usually exceeds the saving.
+  - *Rule 2 — confirm a paid escalation*: escalating into a tier listed in `confirmUpgradeTiers`
+    (default `Performance`) to a paid model, when that tier has **no** free candidate, pops a
+    dialog. Declining, letting it time out, or having no dialog-capable UI (`ctx.hasUI` false,
+    e.g. headless) leaves the current tier untouched — no consent, no spend.
+  - The dialog shows only the **rate multiplier** and says so. `rate` is relative (baseline `1.0`)
+    and there is deliberately no credit↔token conversion, so an absolute credit figure cannot be
+    computed; the extension reports the multiplier rather than inventing a number.
+  - Sub-agent injection runs inside `tool_call` and **must not block on a dialog** (it would stall
+    the tool call, and a workflow with several children would prompt repeatedly), so there it takes
+    the no-consent branch: a tier that would require confirmation is **stepped down one tier**.
 - **Sub-agent tiering** — the `subagent` tool's task is classified independently and the tier's
   anchor model is injected into `input.model`. An explicitly specified model is never overridden.
 - **Same-turn requeue** — when a model-level rate limit hits and rotation succeeded within the
@@ -189,6 +208,7 @@ objects are replaced shallowly — provide the full object when overriding.
 | `subagentTier` | `{ enabled: true }` | Independent tiering of `subagent` tasks |
 | `attemptBudget` | `{ enabled: true, giveUpAfter: 5, notify: true, stopTurn: true, graceAfterUpgradeSec: 30 }` | Consecutive tool failures → record, notify and end the turn (ask-for-help). Keep `giveUpAfter` **above** `midThread.failThreshold` so upgrading is tried first |
 | `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | Thinking level applied after an extension-initiated switch (`minimal` / `low` / `medium` / `high` / `xhigh` / `max`). A manual `/thinking` or an explicit `modelThinkingLevels` entry takes precedence |
+| `costGuard` | `{ enabled: true, shortPromptChars: 200, confirmUpgradeTiers: ["Performance"], confirmTimeoutSec: 120 }` | Free-first inside a tier unless the prompt is ≤ `shortPromptChars`; a paid escalation into `confirmUpgradeTiers` asks first. Decline / timeout / no UI ⇒ stay in the current tier |
 | `errorFeedback.*` | see source | Rate-limit cooldowns + recent-error window (`recentErrorRateThreshold: 0.34`) |
 | `defaultProvider` | `""` | Provider fallback when `ctx.model` is unset at decision time |
 | `promptPreviewChars` | `300` | Prompt text kept in the decision log for audit; `0` keeps prompts off disk entirely |
@@ -210,7 +230,8 @@ objects are replaced shallowly — provide the full object when overriding.
 /router manual [modelId] lock the current (or a named) model
 /router shadow|active    record-only ↔ real switching (session scope)
 /router stats            in-process counters: turns, errors, lane split, mid-thread upgrades,
-                         sub-agent tiering, attempts given up, thinking levels applied
+                         sub-agent tiering, attempts given up, thinking levels applied,
+                         cost-guard redirects / confirmations / declines
 /router version          extension version
 ```
 
@@ -248,12 +269,25 @@ failover-state.json  rotation cooldown windows
 
 ## Graceful degradation
 
-The router is designed to never break a session:
+The router never breaks a session **by failing**:
 
 - unknown model id → `decision: model_not_found`, session keeps its current model
 - health endpoint down → health gate fails open
 - state dir unwritable → logging swallowed, routing continues
 - any exception inside a hook → caught and logged as a `stage` error row
+
+Two behaviours interrupt a turn **deliberately**, and both are bounded and configurable — this
+corrects an earlier, over-broad version of the claim above:
+
+- `attemptBudget` — after `giveUpAfter` consecutive tool failures the extension records the
+  decision, notifies you and **ends the turn**. That is the ask-for-help contract: hammering a
+  model that has already failed repeatedly is not a working state.
+- `costGuard` — a paid escalation pops a dialog and therefore **blocks until you answer or**
+  `confirmTimeoutSec` **elapses**; a timeout is treated as a decline. In a headless session there
+  is nobody to ask, so it declines immediately instead of spending.
+
+Neither changes the model behind your back: the worst outcome of the guard is "stay where you
+are", and the worst outcome of the budget is "stop and hand the problem back".
 
 ## Repository layout
 

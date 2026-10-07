@@ -2,6 +2,43 @@
 
 Notable changes, newest first.
 
+## v0.14.0
+
+- **Cost guard — two rules so automatic tier switching cannot spend money silently.**
+  Free/paid is judged by the *same* set `freeFirst` uses (pricing rows with `rate == 0` ∪ the
+  explicit `pricing.freeModels` list); a model absent from the table is treated as **paid**
+  (conservative). Configured by `costGuard`.
+  - *Rule 1 — free first within the tier*: when the router is about to switch to a paid model and
+    the **same tier** has a *usable* free candidate (not in a cooldown window, channel healthy),
+    it switches to that free candidate instead. The tier is already the classifier's capability
+    verdict, so a free peer inside it costs nothing in capability. A prompt of at most
+    `shortPromptChars` characters is the single exception — its absolute cost is negligible while
+    a free model's cold-start / rate-limit delay usually exceeds the saving.
+  - *Rule 2 — a paid escalation asks first*: escalating into a tier listed in
+    `confirmUpgradeTiers` (default `Performance`) to a paid model, when that tier has **no** free
+    candidate, pops `ctx.ui.confirm`. Declining, letting it time out (`confirmTimeoutSec`), or
+    having no dialog-capable UI ⇒ the session stays in its current tier. No consent, no spend.
+- **Fix: a starting model outside the pool skipped the confirmation entirely.** The upgrade test
+  was `curTier !== null && rank(target) > rank(cur)`; when the current model is not in any pool
+  tier `tierOf()` returns `null`, so the conjunction short-circuited to *false* and no dialog was
+  shown — precisely the "paying without asking" case. An unknown current tier is now treated as an
+  upgrade: if we cannot tell what we are escalating *from*, we ask.
+- **Sub-agent tiering takes the no-consent branch instead of prompting.** Injection happens inside
+  `tool_call`, where a dialog would stall the tool call and prompt repeatedly across the children
+  of a workflow, so a tier that would require confirmation is stepped **down one tier**
+  (`guardedAnchorFor`). The short-prompt exception is not a way around this: it only suppresses
+  rule 1; rule 2 still steps the tier down because there is nobody to ask.
+- **The dialog reports the rate multiplier, never an absolute credit figure.** `rate` is relative
+  (baseline `1.0`) and there is deliberately no credit↔token conversion, so the number cannot be
+  computed; the text says so instead of inventing a figure.
+- **Docs: corrected the over-broad "never breaks a session" claim.** `attemptBudget` (v0.13.0) and
+  `costGuard` (this release) *do* interrupt a turn on purpose — bounded and configurable — and
+  readers were relying on the opposite. Neither changes the model behind your back: the guard's
+  worst case is "stay where you are", the budget's is "stop and hand the problem back".
+- `decision-log.jsonl` rows gain a `costGuard` field (`paid_to_free` / `upgrade_approved` /
+  `upgrade_declined` with reason `user_declined_or_timeout` or `no_ui`); standalone
+  `type: "cost_guard"` rows are emitted on the escalation path. `/router stats` gains a Phase 5 line.
+
 ## v0.13.0
 
 - **Fix: `PRICING_TTL_MS` was used but never defined.** The free-model cache check threw

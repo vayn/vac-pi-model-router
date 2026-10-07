@@ -29,6 +29,12 @@
     "enabled": true,
     "byTier": { "Fast": "minimal", "Balanced": "medium", "Performance": "high" }
   },
+  "costGuard": {
+    "enabled": true,
+    "shortPromptChars": 200,
+    "confirmUpgradeTiers": ["Performance"],
+    "confirmTimeoutSec": 120
+  },
   "errorFeedback": {
     "enabled": true,
     "rateLimitCooldownSec": 180,

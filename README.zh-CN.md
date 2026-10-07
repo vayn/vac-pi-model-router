@@ -69,7 +69,7 @@ classify()  ── 规则分层分类器：Fast / Balanced / Performance
 与「无信号匹配、兜底为 Balanced」，并看出是哪个维度决定了档位。同时写入 `clsVersion`，
 这对校准很重要：不同分类器版本的分数不在同一尺度上，**绝不可混算**。
 
-### 执行期自适应（Phase 3 与 Phase 4）
+### 执行期自适应（Phase 3–5）
 
 两层读同一个信号 —— 同一回合内的**连续**工具失败 —— 且按序执行：先换更强的模型试，
 升不动了才放弃。
@@ -87,6 +87,20 @@ classify()  ── 规则分层分类器：Fast / Balanced / Performance
   `modelThinkingLevels` 显式配置优先级更高。该配置的键是**解析后**的 `provider/modelId`，不是池项
   写法：若池内写的是 `my-gateway/gpt-x`，而 pi 把它解析到 provider `myprovider` 之下，则键为
   `myprovider/my-gateway/gpt-x`；用池项写法作键会静默匹配不上。
+- **成本护栏** —— 两道规则，阻止自动切档在无人知晓的情况下花钱。免费/收费的判定源与
+  `freeFirst` **同一套**集合（定价表中 `rate == 0` 的行 ∪ 显式 `pricing.freeModels` 清单）；
+  表中查不到的模型按**收费**处理（保守口径）。
+  - *规则一·同档内免费优先*：若要切到的模型收费、而**同档存在可用免费候选**（未冷却、渠道健康），
+    路由器改为切到那个免费候选。档位已由分类器定好，同档内的免费同伴不构成能力对价——为同一个
+    档位多花倍率买不到任何东西。极短 prompt（`shortPromptChars`）是唯一例外：其绝对成本可忽略，
+    而免费模型的冷启动/限流延迟往往大于省下的那点钱。
+  - *规则二·付费升档需确认*：升入 `confirmUpgradeTiers` 列出的档位（默认 `Performance`）且目标收费、
+    而该档**无**免费候选时弹窗征询。用户拒绝、超时，或没有可弹窗的 UI（`ctx.hasUI` 为 false，
+    例如 headless）⇒ 保持当前档位不动：没有同意，就不花费。
+  - 弹窗只显示**倍率**并明说这一点。`rate` 是相对倍率（基准 `1.0`），且刻意不做积分↔token 折算，
+    故绝对积分数额算不出来；扩展报倍率而不是编一个数。
+  - 子代理注入发生在 `tool_call` 内，**不能阻塞在弹窗上**（会卡住工具调用，且多个子代理的 workflow
+    会反复打断），故走「无同意」分支：本应确认的档位**降一档**。
 - **子代理自动分档** —— `subagent` 工具的 task 文本被独立分类，其档位锚位模型注入
   `input.model`。显式指定 model 时绝不覆盖。
 - **同回合重发** —— 命中模型级限流且档内轮转成功后，重放原 prompt（带节流）。因为 pi 自身
@@ -173,6 +187,7 @@ pi install ~/pi-packages/model-router
 | `subagentTier` | `{ enabled: true }` | `subagent` 任务独立分档 |
 | `attemptBudget` | `{ enabled: true, giveUpAfter: 5, notify: true, stopTurn: true, graceAfterUpgradeSec: 30 }` | 连续工具失败达阈值 → 记录、提示并结束本回合（ask-for-help）。`giveUpAfter` 应**大于** `midThread.failThreshold`，以保证先尝试升档 |
 | `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | 本扩展切模型后施加的思考等级（`minimal` / `low` / `medium` / `high` / `xhigh` / `max`）。手动 `/thinking` 或 `modelThinkingLevels` 显式配置优先 |
+| `costGuard` | `{ enabled: true, shortPromptChars: 200, confirmUpgradeTiers: ["Performance"], confirmTimeoutSec: 120 }` | 同档内免费优先（极短 prompt 除外）；付费升入 `confirmUpgradeTiers` 前先征询。拒绝 / 超时 / 无 UI ⇒ 留在当前档 |
 | `errorFeedback.*` | 见源码 | 限流冷却 + 近期错误窗口（`recentErrorRateThreshold: 0.34`）|
 | `defaultProvider` | `""` | 决策时 `ctx.model` 未设置时的 provider 兜底 |
 | `promptPreviewChars` | `300` | 决策日志中保留的 prompt 文本长度（审计用）；设为 `0` 则 prompt 完全不落盘 |
@@ -194,7 +209,7 @@ pi install ~/pi-packages/model-router
 /router manual [modelId] 锁定当前（或指定）模型
 /router shadow|active    只记录 ↔ 真实切换（会话级）
 /router stats            进程内计数：回合、错误、泳道分布、mid-thread 升档、子代理分档、
-                         已放弃次数、已施加思考等级
+                         已放弃次数、已施加思考等级、成本护栏改走免费/已确认/被拒次数
 /router version          扩展版本
 ```
 
@@ -230,12 +245,21 @@ failover-state.json  轮转冷却窗
 
 ## 优雅降级
 
-路由器设计上永不阻断会话：
+路由器不会因为**出错**而阻断会话：
 
 - 未知模型 id → `decision: model_not_found`，会话保持当前模型
 - 健康端点不可达 → 健康闸 fail-open
 - 状态目录不可写 → 日志写入被吞掉，路由继续
 - 钩子内任何异常 → 捕获并以 `stage` 错误行记录
+
+但有两个行为是**有意**打断回合的，且都有边界、可配置 —— 上文旧版「永不阻断」的说法过宽，此处更正：
+
+- `attemptBudget` —— 连续工具失败达 `giveUpAfter` 次后，扩展记录决策、提示用户，并**结束本回合**。
+  这就是 ask-for-help 的约定：对着一个已经反复失败的模型继续硬试，不是一个可用状态。
+- `costGuard` —— 付费升档会弹窗，因此**阻塞到你回答或 `confirmTimeoutSec` 超时**为止；超时按拒绝处理。
+  headless 会话里没有人可问，于是立即拒绝，而不是擅自花费。
+
+两者都不会在你不知情时改动模型：护栏最坏结果是「留在原档」，预算最坏结果是「停下并把问题交还给你」。
 
 ## 仓库结构
 

@@ -144,6 +144,23 @@ const DEFAULTS = {
       "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
     >,
   },
+  // ⑤ 成本护栏（v0.14.0）——自动挡切到收费模型前的「免费优先 + 升档确认」两道闸：
+  //   【规则一：同档有可用免费候选就别切收费】当真要切到的目标模型收费、而**同档内存在可用
+  //     免费模型**时：只有极短 prompt（≤ shortPromptChars）才放行，否则**改为切到那个免费模型**
+  //     （留在同档）。第一性原理：档位已由分类器定好，档内选谁不影响能力上限判定；免费候选已在
+  //     池中且健康，那么「多花倍率买同一个档位」就是纯粹支出，没有任何能力对价。极短 prompt
+  //     例外是因为它的绝对成本可忽略，而免费模型的冷启动/限流延迟往往大于省下的那点钱。
+  //   【规则二：升到需确认档且本档无免费候选 ⇒ 弹窗】确认档由 confirmUpgradeTiers 指定。
+  //     无法征得同意（无 UI / 超时 / 用户拒绝）⇒ **不升级、留在原档**（不擅自消耗积分）。
+  //   【为何只在路由器自己切模型时生效】用户手动 /model 锁定的模型由用户负责，本扩展不拦
+  //     （不劫持用户意志）。
+  costGuard: {
+    enabled: true,
+    shortPromptChars: 200, // “极短 prompt”上限（按自有历史分布取小比例侧；可按需调）
+    // 哪些档位在「升过去且需付费」时必须先问（数组 ⇒ 可自行增删确认档）
+    confirmUpgradeTiers: ["Performance"] as string[],
+    confirmTimeoutSec: 120, // 弹窗超时 ⇒ 按拒绝处理（安全默认）
+  },
   errorFeedback: {
     enabled: true,
     rateLimitCooldownSec: 180,
@@ -603,7 +620,7 @@ function markModelError(modelId: string, msg: string, c: Cfg): { kind: string; w
 
 // ---------- P2-4 outcome 统计（进程内会话累计，/router stats 展示） ----------
 
-const outcomes = { turns: 0, errors: 0, modelErrors: 0, retriedTurns: 0, laneCount: { code: 0, knowledge: 0, general: 0 }, midThreadUpgrades: 0, subagentTiered: 0, attemptsGaveUp: 0, thinkingApplied: 0 };
+const outcomes = { turns: 0, errors: 0, modelErrors: 0, retriedTurns: 0, laneCount: { code: 0, knowledge: 0, general: 0 }, midThreadUpgrades: 0, subagentTiered: 0, attemptsGaveUp: 0, thinkingApplied: 0, costGuardRedirected: 0, costGuardConfirmed: 0, costGuardDeclined: 0 };
 let lastTurnHadError = false;
 let lastTurnModelErrKind: string | null = null;
 // Phase 3：mid-thread 升档状态（回合内连续工具失败计数；agent_end 归零）
@@ -696,6 +713,160 @@ function anchorFor(tier: Tier, night: boolean, c: Cfg): { model: string; tier: T
     const t = TIER_DESCENT[i];
     const m = candidatesFor(t, night, c)[0];
     if (m) return { model: m, tier: t };
+  }
+  return null;
+}
+
+// ---------- 成本护栏（v0.14.0） ----------
+// 两条规则共用同一套「付费/免费」判定，故集中在此，供主路径与升档路径共用（单一真相）。
+
+/** 目标模型是否收费。判定源＝与 freeFirst 同一个 freeSet（定价表 rate=0 ∪ 显式清单）。
+ *  查不到条目 ⇒ 按收费处理（与 freeSet 注释同一套保守口径，不误放行）。 */
+function isPaid(modelId: string, c: Cfg): boolean {
+  return !freeSet(c).has(modelId);
+}
+
+/** 同档内可用的免费候选（受时段 gate + 健康/冷却过滤后的真实可用集，非池裸集）。
+ *  为何要过滤而不是直接看池：若同档免费候选正处冷却/渠道不健康，它就不是「可用替代」，
+ *  此时不应因它存在而把决策逼向免费模型（否则从「可用付费」退化成「不可用免费」）。 */
+function freeCandidateInTier(tier: Tier, night: boolean, c: Cfg, health: HealthResult): string | null {
+  const free = freeSet(c);
+  if (free.size === 0) return null;
+  for (const m of candidatesFor(tier, night, c)) {
+    if (!free.has(m)) continue;
+    if (health.status === "ok" && health.channels[channelOf(m)] === false) continue;
+    if (isCooling(m) || isErrorCooling(m)) continue;
+    return m;
+  }
+  return null;
+}
+
+/** 规则一的决策纯函数（无副作用，便于单测）：给定「本来要切到的付费模型」，
+ *  返回应当改切的目标（免费候选）或 null（放行付费）。
+ *  · 非付费目标 → null（无需干预）；
+ *  · 无同档可用免费候选 → null（规则一不适用，交给规则二/其他路径）；
+ *  · prompt 极短 → null（例外放行）；
+ *  · 其余 → 返回该免费候选。 */
+function freeInsteadOfPaid(
+  target: string,
+  targetTier: Tier,
+  promptChars: number,
+  night: boolean,
+  c: Cfg,
+  health: HealthResult,
+): string | null {
+  const cg = c.costGuard;
+  if (!cg?.enabled) return null;
+  if (!isPaid(target, c)) return null;
+  const free = freeCandidateInTier(targetTier, night, c, health);
+  if (!free || free === target) return null;
+  if (promptChars <= cg.shortPromptChars) return null; // 极短 prompt 例外
+  return free;
+}
+
+/** 规则二：升到指定档位且目标收费时，是否必须先征得用户同意。
+ *  返回 true 仅当「目标收费 ∧ 该档在 confirmUpgradeTiers 内 ∧ 该档无可用免费候选」。
+ *  为何要看「无可用免费候选」：若本档有免费候选，规则一已经把它换上了，自然不需要问。 */
+function needsUpgradeConfirm(
+  target: string,
+  targetTier: Tier,
+  night: boolean,
+  c: Cfg,
+  health: HealthResult,
+): boolean {
+  const cg = c.costGuard;
+  if (!cg?.enabled) return false;
+  if (!(cg.confirmUpgradeTiers ?? []).includes(targetTier)) return false;
+  if (!isPaid(target, c)) return false;
+  return freeCandidateInTier(targetTier, night, c, health) === null;
+}
+
+/** 倍率（供弹窗展示）。【数据缺口】定价表只有相对倍率 rate（基准=1.0），
+ *  没有可靠的绝对单价，故**只报倍率、不编造积分数字**（本仓纪律：无源不报）。
+ *  0 = 免费；查不到条目 = null（显示为「费率未知」而非猜一个数）。 */
+function rateOf(modelId: string): number | null {
+  try {
+    const file = process.env.MODEL_ROUTER_PRICING || cfg.pricing?.file || "";
+    if (!file) return null;
+    const raw = JSON.parse(readFileSync(file, "utf8"));
+    const rows: Array<{ model?: unknown; channel?: unknown; rate?: unknown }> = Array.isArray(raw)
+      ? raw
+      : (raw?.models ?? []);
+    for (const r of rows) {
+      if (`${String(r.channel ?? "")}/${String(r.model ?? "")}` === modelId) {
+        return typeof r.rate === "number" ? r.rate : null;
+      }
+    }
+  } catch {
+    /* 定价表不可读 ⇒ 无倍率可展示；不阻断 */
+  }
+  return null;
+}
+
+/** 规则二的交互面：弹窗征询；任何异常/超时/无 UI ⇒ 返回 false（＝拒绝，安全默认）。
+ *  【为何无 UI 时不升级】无法征得同意就不擅自消耗积分；headless/RPC 下 hasUI=false
+ *  ⇒ 直接拒绝，行为可预期且不烧钱。 */
+async function confirmUpgrade(
+  ctx: { hasUI?: boolean; ui?: { confirm(title: string, message: string, opts?: { timeout?: number }): Promise<boolean> } },
+  target: string,
+  targetTier: Tier,
+  fromTier: Tier | null,
+  promptChars: number,
+  c: Cfg,
+): Promise<boolean> {
+  const rate = rateOf(target);
+  const rateText = rate === null ? "费率未知（定价表无条目）" : rate === 0 ? "免费" : `x${rate}（基准 = 1.0）`;
+  const night = isNight(new Date().getHours(), c.timeGate);
+  const freeNow = freeCandidateInTier(targetTier, night, c, { status: "unknown", channels: {} });
+  const msg = [
+    `目标模型  ${target}`,
+    `计费倍率  ${rateText}`,
+    `当前档位  ${fromTier ?? "?"} → 目标档位 ${targetTier}${freeNow ? `（本档有免费候选 ${freeNow}）` : "（本档无免费候选）"}`,
+    `prompt    ${promptChars} 字符`,
+    "",
+    "说明：绝对积分无法折算（定价表仅提供相对倍率，无基准价）。",
+  ].join("\n");
+  try {
+    if (!ctx?.hasUI || !ctx.ui?.confirm) return false;
+    const ok = await ctx.ui.confirm(`确认升级到 ${targetTier} 档？`, msg, {
+      timeout: Math.max(1, c.costGuard.confirmTimeoutSec) * 1000,
+    });
+    return ok === true;
+  } catch {
+    return false; // 弹窗失败一律按拒绝（安全侧）
+  }
+}
+
+/** 子代理分档的「成本护栏版」锚位（无交互版）。
+ *  【为何与主路径不同】子代理注入发生在 tool_call 内，**不能阻塞在弹窗上**：
+ *    ① 会卡住工具调用；② 一个 workflow 可能多个子代理，弹窗会反复打断。
+ *    故采用「无法征得同意 ⇒ 不花钱」的安全侧：需确认的档位**降一档**取锚位，而不是直接注入付费。
+ *  【规则顺序】先免费替代（同档，无能力对价），再判是否需确认（降档），否则用原锚位。
+ *    注意：短 prompt 例外（freeInsteadOfPaid 内部）在此不构成「绕过确认」的后门——
+ *    短 prompt 只是使规则一不干预，随后规则二照样会因「无人可问」而降档。 */
+function guardedAnchorFor(
+  tier: Tier,
+  promptChars: number,
+  night: boolean,
+  c: Cfg,
+  health: HealthResult,
+): { model: string; tier: Tier; guard: Record<string, unknown> | null } | null {
+  const start = TIER_DESCENT.indexOf(tier);
+  for (let i = start; i < TIER_DESCENT.length; i++) {
+    const t = TIER_DESCENT[i];
+    const m = candidatesFor(t, night, c)[0];
+    if (!m) continue;
+    const freeAlt = freeInsteadOfPaid(m, t, promptChars, night, c, health);
+    if (freeAlt) {
+      return {
+        model: freeAlt, tier: t,
+        guard: { action: "paid_to_free", from: m, to: freeAlt, tier: t, paidRate: rateOf(m), promptChars },
+      };
+    }
+    if (needsUpgradeConfirm(m, t, night, c, health)) {
+      continue; // 需确认但无人可问 ⇒ 降一档（不擅自消耗积分）
+    }
+    return { model: m, tier: t, guard: null };
   }
   return null;
 }
@@ -941,6 +1112,7 @@ function statsMessage(c: Cfg): string {
     `泳道分布: code=${outcomes.laneCount.code} knowledge=${outcomes.laneCount.knowledge} general=${outcomes.laneCount.general}`,
     `Phase 3 深化: mid-thread 升档 ${outcomes.midThreadUpgrades} 次 | 子代理分档注入 ${outcomes.subagentTiered} 次`,
     `Phase 4: 尝试预算 ${cfg.attemptBudget?.enabled ? `开(连败${cfg.attemptBudget.giveUpAfter}次⇒停止回合)` : "关"} | 已放弃 ${outcomes.attemptsGaveUp} | 思考等级已施加 ${outcomes.thinkingApplied} | 本回合连败 ${toolFailStreak}`,
+    `Phase 5 成本护栏: 改走免费 ${outcomes.costGuardRedirected} 次 | 升档已确认 ${outcomes.costGuardConfirmed} 次 | 升档被拒/无UI ${outcomes.costGuardDeclined} 次`,
     `错误反馈窗（P2-1）: ${errCooling || "无"}`,
     `（跨进程持久决策明细: ${LOG_PATH}；回合 outcome: ${OUTCOME_LOG_PATH}；error-state: ${ERROR_STATE_PATH}）`,
   ].join("\n");
@@ -1032,6 +1204,8 @@ export default function (pi: ExtensionAPI) {
       let decision: string;
       let switchedTo: string | null = null;
       let setOk: boolean | null = null;
+      let costGuard: Record<string, unknown> | null = null;
+      let declinedUpgrade = false;
 
       if (dec.model === null) {
         decision = "no_viable";
@@ -1040,22 +1214,69 @@ export default function (pi: ExtensionAPI) {
       } else if (cfg.mode === "shadow") {
         decision = "would_switch";
       } else {
-        const target = resolveModel(ctx.modelRegistry, ctx.model?.provider ?? cfg.defaultProvider, dec.model);
-        if (!target) {
-          decision = "model_not_found";
+        // ── 成本护栏（v0.14.0）──
+        // 此地是**所有自动切换的唯一出口**（主路径）——故两条规则都挂在这里，而不是散在
+        // decide() 里（decide 是纯决策，不应做交互，也不应知道 prompt 长度这类外部变量）。
+        const pChars = [...event.prompt].length;
+        let wantModel = dec.model;
+        let wantTier = dec.tier;
+        const nightNow = isNight(hour, cfg.timeGate);
+
+        // 规则一：有免费候选就别切收费（极短 prompt 除外）
+        const freeAlt = freeInsteadOfPaid(wantModel, wantTier, pChars, nightNow, cfg, dec.health);
+        if (freeAlt) {
+          costGuard = {
+            action: "paid_to_free", from: wantModel, to: freeAlt, tier: wantTier,
+            paidRate: rateOf(wantModel), promptChars: pChars, promptIsShort: false,
+          };
+          outcomes.costGuardRedirected += 1;
+          wantModel = freeAlt;
         } else {
-          routerSwitching = true;
-          try {
-            setOk = await pi.setModel(target);
-          } finally {
-            routerSwitching = false;
-            lastRouterSwitchAt = Date.now();
+          // 规则二：无可免费替代的「升档且付费」 ⇒ 弹窗；拒绝/超时/无 UI ⇒ 留在原档
+          // 「升档」以**当前模型所在档**为基准（不是分类器判出的档），否则同档换模型会被误判为升档。
+          // 【curTier===null 必须视为升档】起手模型常不在池内（例如 defaultModel 指向一个池外模型，
+          //   tierOf 返回 null），若当作「未升档」就会完全跳过确认 —— 恰好是「花着钱但没人问」的
+          //   最坏情形。档位未知时保守当作升档：花钱需要同意，不知道从哪升上来时更需要同意。
+          const curTier = tierOf(currentId, cfg);
+          const tierRank = (t: Tier) => TIER_DESCENT.length - TIER_DESCENT.indexOf(t);
+          const upgrading = curTier === null || tierRank(wantTier) > tierRank(curTier);
+          if (upgrading && needsUpgradeConfirm(wantModel, wantTier, nightNow, cfg, dec.health)) {
+            const approved = await confirmUpgrade(ctx, wantModel, wantTier, curTier, pChars, cfg);
+            if (!approved) {
+              costGuard = {
+                action: "upgrade_declined", target: wantModel, tier: wantTier,
+                rate: rateOf(wantModel), promptChars: pChars,
+                reason: ctx.hasUI ? "user_declined_or_timeout" : "no_ui",
+              };
+              outcomes.costGuardDeclined += 1;
+              declinedUpgrade = true; // 留在原档：不调 setModel
+            } else {
+              costGuard = { action: "upgrade_approved", target: wantModel, tier: wantTier, rate: rateOf(wantModel) };
+              outcomes.costGuardConfirmed += 1;
+            }
           }
-          if (setOk) {
-            decision = "switched";
-            switchedTo = `${target.provider}/${target.id}`;
+        }
+
+        if (declinedUpgrade) {
+          decision = "no_change";
+        } else {
+          const target = resolveModel(ctx.modelRegistry, ctx.model?.provider ?? cfg.defaultProvider, wantModel);
+          if (!target) {
+            decision = "model_not_found";
           } else {
-            decision = "switch_failed";
+            routerSwitching = true;
+            try {
+              setOk = await pi.setModel(target);
+            } finally {
+              routerSwitching = false;
+              lastRouterSwitchAt = Date.now();
+            }
+            if (setOk) {
+              decision = "switched";
+              switchedTo = `${target.provider}/${target.id}`;
+            } else {
+              decision = "switch_failed";
+            }
           }
         }
       }
@@ -1078,6 +1299,8 @@ export default function (pi: ExtensionAPI) {
         switchedTo,
         setOk,
         thinkingLevel,
+        // 成本护栏轨迹：null 表示未触发（目标非付费，或护栏关闭）
+        costGuard,
       });
     } catch (e) {
       appendLog({ ts, stage: "before_agent_start", err: String(e).slice(0, 300) });
@@ -1095,15 +1318,20 @@ export default function (pi: ExtensionAPI) {
         const singleChild = task && input.agent && !input.action && !input.chain && !input.tasks;
         if (singleChild && input.model === undefined) {
           const cls = classify(task);
-          const anchor = anchorFor(cls.tier, isNight(new Date().getHours(), cfg.timeGate), cfg);
+          const pChars = [...task].length;
+          const night = isNight(new Date().getHours(), cfg.timeGate);
+          const health = await probeHealth(cfg);
+          const anchor = guardedAnchorFor(cls.tier, pChars, night, cfg, health);
           if (anchor) {
             input.model = anchor.model;
             outcomes.subagentTiered += 1;
+            if (anchor.guard) outcomes.costGuardRedirected += 1;
             appendLog({
               ts: new Date().toISOString(), type: "subagent_tier",
               taskPreview: [...task].slice(0, 60).join(""),
               tier: cls.tier, rule: cls.rule, score: cls.score, lane: cls.lane,
               model: anchor.model, landedTier: anchor.tier, agent: input.agent ?? null, gear,
+              costGuard: anchor.guard,
             });
           }
         }
@@ -1128,13 +1356,45 @@ export default function (pi: ExtensionAPI) {
       const curId = ctx.model?.id;
       const curTier = curId ? tierOf(curId, cfg) : null;
       if (!curId || !curTier) return; // 越池模型（手动强制）不参与升级/放弃
-      const mt = cfg.midThread;
 
       // ① mid-thread 升档（v0.11.0 语义不变）
       const up = upgradeTierForStreak(curTier, cfg);
       if (up) {
-        const anchor = anchorFor(up.tier, isNight(new Date().getHours(), cfg.timeGate), cfg);
-        const targetId = anchor && anchor.model !== curId ? anchor.model : null;
+        const nightNow = isNight(new Date().getHours(), cfg.timeGate);
+        const upHealth = await probeHealth(cfg);
+        const anchor = anchorFor(up.tier, nightNow, cfg);
+        let targetId = anchor && anchor.model !== curId ? anchor.model : null;
+        // ── 成本护栏（与 before_agent_start 同用一套纯函数，单一真相）──
+        // 升档路径与主路径同样是「自动切换」，故同样受约束；否则升档会成为绕过成本护栏的后门。
+        // 与主路径的差别：此处无 event.prompt，用上一次 prompt 的长度（同回合内即本回合的 prompt）。
+        if (targetId && anchor) {
+          const pChars = [...(lastPrompt ?? "")].length;
+          const freeAlt = freeInsteadOfPaid(targetId, anchor.tier, pChars, nightNow, cfg, upHealth);
+          if (freeAlt) {
+            outcomes.costGuardRedirected += 1;
+            appendLog({
+              ts: new Date().toISOString(), type: "cost_guard", action: "paid_to_free",
+              stage: "mid_thread_upgrade", from: targetId, to: freeAlt, tier: anchor.tier,
+              paidRate: rateOf(targetId), promptChars: pChars, gear,
+            });
+            targetId = freeAlt;
+          } else if (needsUpgradeConfirm(targetId, anchor.tier, nightNow, cfg, upHealth)) {
+            const approved = await confirmUpgrade(ctx, targetId, anchor.tier, curTier, pChars, cfg);
+            appendLog({
+              ts: new Date().toISOString(), type: "cost_guard",
+              action: approved ? "upgrade_approved" : "upgrade_declined",
+              stage: "mid_thread_upgrade", target: targetId, tier: anchor.tier,
+              rate: rateOf(targetId), promptChars: pChars,
+              reason: approved ? "user_approved" : ctx.hasUI ? "user_declined_or_timeout" : "no_ui",
+              gear,
+            });
+            if (approved) outcomes.costGuardConfirmed += 1;
+            else {
+              outcomes.costGuardDeclined += 1;
+              targetId = null; // 未获同意⇒本次不升档（留在原模型），交由 attemptBudget 决定是否放弃
+            }
+          }
+        }
         const target = targetId ? resolveModel(ctx.modelRegistry, ctx.model?.provider, targetId) : undefined;
         if (target && targetId) {
           routerSwitching = true;
@@ -1155,7 +1415,7 @@ export default function (pi: ExtensionAPI) {
               ts: new Date().toISOString(), type: "mid_thread_upgrade",
               from: curId, to: targetId, fromTier: curTier, toTier: up.tier,
               landedTier: anchor?.tier ?? null, failStreak: toolFailStreak,
-              threshold: mt.failThreshold, gear,
+              threshold: cfg.midThread.failThreshold, gear,
               thinkingLevel: think,
             });
             return; // 刚升过档——本轮不再判弃（新模型需一次机会证明自己）
