@@ -69,10 +69,22 @@ classify()  ── 规则分层分类器：Fast / Balanced / Performance
 与「无信号匹配、兜底为 Balanced」，并看出是哪个维度决定了档位。同时写入 `clsVersion`，
 这对校准很重要：不同分类器版本的分数不在同一尺度上，**绝不可混算**。
 
-### 执行期自适应（Phase 3）
+### 执行期自适应（Phase 3 与 Phase 4）
+
+两层读同一个信号 —— 同一回合内的**连续**工具失败 —— 且按序执行：先换更强的模型试，
+升不动了才放弃。
 
 - **mid-thread 升档** —— 同一回合内三次**连续**工具失败，说明该 prompt 被低估为简单；路由器
   升一档（每回合至多一次，带冷却）。一次成功即归零：连续失败才是难度信号，偶发失败是噪声。
+  升档目标取自 `anchorFor()` —— 它沿降档链找到**当前时刻**确有可用候选的首个档位
+  （时段闸被计入），因此升档绝不会落在一个此小时不可用的模型上。
+- **尝试预算（ask-for-help）** —— 连续五次失败即认定「重试无效」：记录该决策、提示用户，
+  并**结束本回合**，把问题交还给人。由于升档每回合至多一次，没有这一层时，升完那一级后再
+  连败就只剩 agent 硬试而无人知晓。`graceAfterUpgradeSec` 保证刚升过档的模型在证明自己之前
+  不会被立即判弃。
+- **档位→思考等级** —— `Fast` → `minimal`、`Balanced` → `medium`、`Performance` → `high`。
+  只在**本扩展自己切模型**时施加，故手动 `/thinking` 永不被打断；settings 中针对具体模型的
+  `modelThinkingLevels` 显式配置优先级更高。
 - **子代理自动分档** —— `subagent` 工具的 task 文本被独立分类，其档位锚位模型注入
   `input.model`。显式指定 model 时绝不覆盖。
 - **同回合重发** —— 命中模型级限流且档内轮转成功后，重放原 prompt（带节流）。因为 pi 自身
@@ -156,6 +168,8 @@ pi install ~/pi-packages/model-router
 | `lanePref` | `{ code: [], knowledge: [] }` | 档内泳道优先候选（`code` / `knowledge`）|
 | `midThread` | `{ enabled: true, failThreshold: 3, cooldownSec: 60 }` | 连续工具失败 → 升一档 |
 | `subagentTier` | `{ enabled: true }` | `subagent` 任务独立分档 |
+| `attemptBudget` | `{ enabled: true, giveUpAfter: 5, notify: true, stopTurn: true, graceAfterUpgradeSec: 30 }` | 连续工具失败达阈值 → 记录、提示并结束本回合（ask-for-help）。`giveUpAfter` 应**大于** `midThread.failThreshold`，以保证先尝试升档 |
+| `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | 本扩展切模型后施加的思考等级（`minimal` / `low` / `medium` / `high` / `xhigh` / `max`）。手动 `/thinking` 或 `modelThinkingLevels` 显式配置优先 |
 | `errorFeedback.*` | 见源码 | 限流冷却 + 近期错误窗口（`recentErrorRateThreshold: 0.34`）|
 | `defaultProvider` | `""` | 决策时 `ctx.model` 未设置时的 provider 兜底 |
 

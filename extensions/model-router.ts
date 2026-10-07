@@ -21,12 +21,18 @@
  *   6. 泳道偏好 lanePref：code / knowledge 泳道优先指定候选
  *   7. 级联降档 downgrade：Performance → Balanced → Fast；全空 → tier_exhausted / no_viable
  *
- * 执行期深化（Phase 3）：
+ * 执行期深化（Phase 3 & 4）：
  *   · mid-thread 升档——回合内连续工具失败 ≥ midThread.failThreshold ⇒ 任务实为 hard
  *     （起点分类误判），升 1 级（每回合至多 1 次 + 冷却）；成功即归零（连续性才是难度信号）
+ *   · 尝试预算——连续失败 ≥ attemptBudget.giveUpAfter ⇒ 承认卡住：记录 + 提示 + **结束本回合**
+ *     交还人（ask-for-help）。与升档共用同一信号、同一 handler，按序执行：先升档，升不动才判弃
+ *   · 档位→思考等级——本扩展自切模型后施加 thinkingTier.byTier（Fast=minimal/Balanced=medium/
+ *     Performance=high）；手动 /thinking 与 settings.modelThinkingLevels 显式配置优先，不覆盖用户意图
  *   · 子代理自动分档——subagent 工具按 task 文本独立分档，注入该档锚位
  *     （显式 model 不覆盖；workflow/chain 多子代理不强插）
  *   · 同回合重发——模型级限流且轮转成功后，重放原 prompt（每回合至多 1 次 + 节流）
+ *   · 时段闸唯一时相——candidatesFor() 是唯一过滤点，anchorFor() 供升档/子代理取「当前可用锚位」，
+ *     故白天升档不会拿到夜间限免模型（那是「升级救命却升到一个用不了的模型」）
  *
  * 状态与日志（全部本地文件；决策日志 append-only，8MB 轮转保留一代）：
  *   decision-log.jsonl  每次决策一条：signals/score/rule/tier/gateChain/finalTier/decision…
@@ -60,6 +66,10 @@ const LEGACY_LOG_PATH = join(STATE_DIR, "shadow-log.jsonl"); // Phase 0 旧日�
 const LOG_MAX_BYTES = 8 * 1024 * 1024;
 // 健康探测用的网关鉴权配置（JSON 含 api_key）——经环境变量注入，代码不内置本机路径。
 const GATEWAY_CONFIG = process.env.MODEL_ROUTER_GATEWAY_CONFIG ?? "";
+// 定价表缓存 TTL（免费判定）；数据源变化时另有指纹分键立即失效，故此值只兜「文件内容变更」。
+// 注：路径常量一律在函数体内读 process.env——模块级常量的可见性在扩展加载后不保证
+//（实测 before_agent_start 报 ReferenceError），故此处只放纯数值常量。
+const PRICING_TTL_MS = 5 * 60 * 1000;
 
 
 
@@ -89,6 +99,8 @@ const DEFAULTS = {
     freeModels: [] as string[],
   },
   channels: ["your-provider"],
+  // 决策时 ctx.model 尚未设置（会话首轮）用的 provider 兜底；空串 ⇒ 交给 resolveModel 走全注册表兜底。
+  defaultProvider: "",
   promptPreviewChars: 300,
   // failover 名义对（仅作 /router status 展示语义，实际轮转按「池序后继」执行）
   // v0.8.0：primary 跟随 Balanced 池锚位改为同模型免费渠道（实际轮转以池序为准，
@@ -111,6 +123,27 @@ const DEFAULTS = {
   midThread: { enabled: true, failThreshold: 3, cooldownSec: 60 },
   // ② 子代理自动分档——subagent 工具按 task 文本独立分档注入 model（显式 model 不覆盖）
   subagentTier: { enabled: true },
+  // Phase 4（v0.13.0）：与 midThread 互补的第二层「卡住」处理：
+  // ③ 尝试预算（ask-for-help 语义）——两层语义正交，不重叠：
+  //    · midThread（阈值 3）= 升档重试（换更强的模型，仍在**同一会话内继续**）
+  //    · attemptBudget（阈值 5）= 放弃（已升过档 / 已到顶档仍连败 ⇒ **停止本回合**并提示用户）
+  //    即先「换个模型再试」，再「承认卡住、交还人」。阈值必须**大于** midThread 才成阶梯。
+  //    graceAfterUpgradeSec：刚升过档不立即判弃——否则新模型根本没机会证明自己，
+  //    等于把「升档重试」和「放弃」压成同一个动作。
+  attemptBudget: { enabled: true, giveUpAfter: 5, notify: true, stopTurn: true, graceAfterUpgradeSec: 30 },
+  // ④ 档位→思考等级映射（v0.13.0）：简单活少想、难活多想。
+  //    只在本扩展**自己切换模型**时施加（不劫持用户手动 /thinking 的意志），
+  //    且当 settings.modelThinkingLevels 对目标模型有显式配置时让位于该配置（用户显式意图优先）。
+  //    未支持 reasoning 的模型由 pi 自行 clamp，无需本扩展判断。
+  thinkingTier: {
+    enabled: true,
+    // 键为 Tier 名；用 Record<string,…> 而非 Record<Tier,…>——Tier 由 `keyof typeof DEFAULTS.pool`
+    // 定义，在 DEFAULTS 字面量内引用会构成循环定义。
+    byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } as Record<
+      string,
+      "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    >,
+  },
   errorFeedback: {
     enabled: true,
     rateLimitCooldownSec: 180,
@@ -570,13 +603,15 @@ function markModelError(modelId: string, msg: string, c: Cfg): { kind: string; w
 
 // ---------- P2-4 outcome 统计（进程内会话累计，/router stats 展示） ----------
 
-const outcomes = { turns: 0, errors: 0, modelErrors: 0, retriedTurns: 0, laneCount: { code: 0, knowledge: 0, general: 0 }, midThreadUpgrades: 0, subagentTiered: 0 };
+const outcomes = { turns: 0, errors: 0, modelErrors: 0, retriedTurns: 0, laneCount: { code: 0, knowledge: 0, general: 0 }, midThreadUpgrades: 0, subagentTiered: 0, attemptsGaveUp: 0, thinkingApplied: 0 };
 let lastTurnHadError = false;
 let lastTurnModelErrKind: string | null = null;
 // Phase 3：mid-thread 升档状态（回合内连续工具失败计数；agent_end 归零）
 let toolFailStreak = 0;
 let upgradedThisTurn = false;
 let lastUpgradeAt = 0; // 升档冷却独立计时——不能复用 lastRouterSwitchAt（开局 setModel 也刷新它，会把首回合升级永久压制）
+// Phase 4：尝试预算（ask-for-help）——回合内只放弃一次（防重复 abort）
+let gaveUpThisTurn = false;
 
 // ---------- P2-4 后半：回合级 outcome 落盘（校准分类器的数据基础） ----------
 // 【动因】原 outcomes 仅**进程内计数**（/router stats），进程退出即失；且决策日志无 outcome 字段
@@ -645,9 +680,24 @@ interface Decision {
 const TIER_DESCENT: Tier[] = ["Performance", "Balanced", "Fast"];
 
 function candidatesFor(tier: Tier, night: boolean, c: Cfg): string[] {
-  // Performance 池若被时段闸剔空 → decide() 自然级联降档 Balanced（级联兜底）
+  // 时段闸在此**唯一**生效：限免/限时模型白天从候选剔除、夜间恢复。
+  // 放在这里（而非只放 decide()）是因为 mid-thread 升档与子代理分档都直接取候选首位——
+  // 若只在 decide() 过滤，那两条路径白天会拿到夜间限免模型，升档即撞限流（升到一个用不了的模型）。
+  // Performance 池被剔空 → 调用方自然级联降档 Balanced（级联兜底，无需在此特判）。
+  const usable = c.pool[tier].filter((m) => !(m === c.timeGate.model && !night));
   // Free models first within a tier; order within each group is preserved.
-  return freeFirst(c.pool[tier], c);
+  return freeFirst(usable, c);
+}
+
+/** 沿降档链取首个非空锚位——升档/子代理注入的唯一取模入口（保证拿到的是当前时段可用者）。 */
+function anchorFor(tier: Tier, night: boolean, c: Cfg): { model: string; tier: Tier } | null {
+  const start = TIER_DESCENT.indexOf(tier);
+  for (let i = start; i < TIER_DESCENT.length; i++) {
+    const t = TIER_DESCENT[i];
+    const m = candidatesFor(t, night, c)[0];
+    if (m) return { model: m, tier: t };
+  }
+  return null;
 }
 
 async function decide(
@@ -668,9 +718,7 @@ async function decide(
 
   for (let i = startIdx; i < TIER_DESCENT.length; i++) {
     const t = TIER_DESCENT[i];
-    let cands = candidatesFor(t, night, c);
-    // 时段 gate：白天剔除限免模型（防御性兜底）
-    cands = cands.filter((m) => !(m === c.timeGate.model && !night));
+    const cands = candidatesFor(t, night, c);
     lastCandidates = cands;
     const viable0 =
       health.status === "ok" ? cands.filter((m) => health.channels[channelOf(m)] !== false) : cands;
@@ -804,6 +852,46 @@ function upgradeTierForStreak(curTier: Tier, c: Cfg): { tier: Tier; from: Tier }
   return { tier: next, from: curTier };
 }
 
+// ── 尝试预算（ask-for-help）──
+// 与 upgradeTierForStreak 共用同一信号（连续工具失败），但判据不同：
+//   · 升档问「还能不能往上换一个」；本函数问「换了也没用，是否该停下交还人」。
+//   · 阈值递增（5 > 3）保证次序：先升档重试，升不动或升完仍败才判弃。
+//   · graceAfterUpgradeSec：刚升档后的冷却窗内即使 streak 已达标也先不判弃。
+function attemptBudgetExhausted(c: Cfg): boolean {
+  const ab = c.attemptBudget;
+  if (!ab?.enabled || gaveUpThisTurn) return false;
+  if (toolFailStreak < ab.giveUpAfter) return false;
+  if (upgradedThisTurn && Date.now() - lastUpgradeAt < ab.graceAfterUpgradeSec * 1000) return false;
+  return true;
+}
+
+// ── 档位→思考等级 ──
+// 语义边界（三条，均「不覆盖用户意图」）：
+//   ① 只在本扩展自己切模型后调用（用户 /thinking 手动设定不经过这里）；
+//   ② settings.modelThinkingLevels 对该模型有显式配置 ⇒ 让位；
+//   ③ 已是目标等级 ⇒ 不重复设置。
+// 返回施加的等级（未施加则 null），供决策日志留痕。
+// 【键口径】modelId 必须是**解析后模型**的 `${provider}/${id}`（即 settings.modelThinkingLevels 的键），
+//   而不是池项写法 `<channel>/<model>`——二者通常不同（池项前缀是网关渠道名，
+//   解析后的 provider 是 pi 的注册 provider 名）。传池项写法会**永远查不中**用户配置
+//   ⇒ 静默覆盖用户显式意图。这层「用户显式配置优先」的保证即因此失效。
+function applyThinkingTier(pi: ExtensionAPI, modelId: string, tier: Tier, c: Cfg): string | null {
+  const tt = c.thinkingTier;
+  if (!tt?.enabled) return null;
+  const want = tt.byTier?.[tier];
+  if (!want) return null;
+  try {
+    const explicit = pi.getSettings()?.modelThinkingLevels?.[modelId];
+    if (explicit) return null; // 用户显式配置优先，不覆盖
+    if (pi.getThinkingLevel() === want) return null;
+    pi.setThinkingLevel(want);
+    outcomes.thinkingApplied += 1;
+    return want;
+  } catch {
+    return null; // 思考等级调整失败不得阻断会话
+  }
+}
+
 function appendLog(rec: Record<string, unknown>) {
   try {
     mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -852,6 +940,7 @@ function statsMessage(c: Cfg): string {
     `回合: ${outcomes.turns} | 含错误回合: ${outcomes.retriedTurns} | 模型级限流命中: ${outcomes.modelErrors}（错误事件累计 ${outcomes.errors}）`,
     `泳道分布: code=${outcomes.laneCount.code} knowledge=${outcomes.laneCount.knowledge} general=${outcomes.laneCount.general}`,
     `Phase 3 深化: mid-thread 升档 ${outcomes.midThreadUpgrades} 次 | 子代理分档注入 ${outcomes.subagentTiered} 次`,
+    `Phase 4: 尝试预算 ${cfg.attemptBudget?.enabled ? `开(连败${cfg.attemptBudget.giveUpAfter}次⇒停止回合)` : "关"} | 已放弃 ${outcomes.attemptsGaveUp} | 思考等级已施加 ${outcomes.thinkingApplied} | 本回合连败 ${toolFailStreak}`,
     `错误反馈窗（P2-1）: ${errCooling || "无"}`,
     `（跨进程持久决策明细: ${LOG_PATH}；回合 outcome: ${OUTCOME_LOG_PATH}；error-state: ${ERROR_STATE_PATH}）`,
   ].join("\n");
@@ -971,6 +1060,11 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      // 档位→思考等级：只在本扩展**自己切成功**之后施加（用户手动 /thinking 不经过此路径）。
+      // 键＝解析后 provider/id（switchedTo 即该形态）；不能用 dec.model——那是池项写法，查不中配置。
+      const thinkingLevel =
+        decision === "switched" && switchedTo ? applyThinkingTier(pi, switchedTo, dec.tier, cfg) : null;
+
       appendLog({
         ...base,
         night: dec.night,
@@ -983,6 +1077,7 @@ export default function (pi: ExtensionAPI) {
         decision,
         switchedTo,
         setOk,
+        thinkingLevel,
       });
     } catch (e) {
       appendLog({ ts, stage: "before_agent_start", err: String(e).slice(0, 300) });
@@ -1000,16 +1095,15 @@ export default function (pi: ExtensionAPI) {
         const singleChild = task && input.agent && !input.action && !input.chain && !input.tasks;
         if (singleChild && input.model === undefined) {
           const cls = classify(task);
-          const cands = candidatesFor(cls.tier, isNight(new Date().getHours(), cfg.timeGate), cfg);
-          const anchor = cands[0];
+          const anchor = anchorFor(cls.tier, isNight(new Date().getHours(), cfg.timeGate), cfg);
           if (anchor) {
-            input.model = anchor;
+            input.model = anchor.model;
             outcomes.subagentTiered += 1;
             appendLog({
               ts: new Date().toISOString(), type: "subagent_tier",
               taskPreview: [...task].slice(0, 60).join(""),
               tier: cls.tier, rule: cls.rule, score: cls.score, lane: cls.lane,
-              model: anchor, agent: input.agent ?? null, gear,
+              model: anchor.model, landedTier: anchor.tier, agent: input.agent ?? null, gear,
             });
           }
         }
@@ -1022,40 +1116,75 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ① mid-thread 升档：连续工具失败 ≥ 阈值 ⇒ 任务实为 hard/agentic（起点分类误判），升 1 级
+  // 【为什么两件事同一个 handler】mid-thread 升档与尝试预算共用同一个信号源（回合内**连续**
+  //   工具失败计数），分成两个 handler 会变成「两个真相」——执行先后无法保证，
+  //   `upgradedThisTurn` 会读脏。落在一个 handler 里，次序即代码次序。
+  // 【顺序】先试升档（换模型再试一次），升不动了才判弃——见 attemptBudgetExhausted 注释。
   pi.on("tool_result", async (event, ctx) => {
     try {
-      if (!cfg.midThread.enabled) return;
       if (!event.isError) { toolFailStreak = 0; return; }
       toolFailStreak += 1;
       if (gear === "manual") return; // 手动挡绝对优先：用户锁的模型不由路由器擅动
-      const mt = cfg.midThread;
       const curId = ctx.model?.id;
       const curTier = curId ? tierOf(curId, cfg) : null;
-      if (!curId || !curTier) return;
+      if (!curId || !curTier) return; // 越池模型（手动强制）不参与升级/放弃
+      const mt = cfg.midThread;
+
+      // ① mid-thread 升档（v0.11.0 语义不变）
       const up = upgradeTierForStreak(curTier, cfg);
-      if (!up) return;
-      const cands = candidatesFor(up.tier, isNight(new Date().getHours(), cfg.timeGate), cfg);
-      const targetId = cands[0];
-      if (!targetId || targetId === curId) return;
-      const target = resolveModel(ctx.modelRegistry, ctx.model?.provider, targetId);
-      if (!target) return;
-      routerSwitching = true;
-      let ok = false;
-      try {
-        ok = await pi.setModel(target);
-      } finally {
-        routerSwitching = false;
-        lastRouterSwitchAt = Date.now();
+      if (up) {
+        const anchor = anchorFor(up.tier, isNight(new Date().getHours(), cfg.timeGate), cfg);
+        const targetId = anchor && anchor.model !== curId ? anchor.model : null;
+        const target = targetId ? resolveModel(ctx.modelRegistry, ctx.model?.provider, targetId) : undefined;
+        if (target && targetId) {
+          routerSwitching = true;
+          let ok = false;
+          try {
+            ok = await pi.setModel(target);
+          } finally {
+            routerSwitching = false;
+            lastRouterSwitchAt = Date.now();
+          }
+          if (ok) {
+            upgradedThisTurn = true; // 每回合至多 1 次（防振荡）
+            lastUpgradeAt = Date.now(); // 升档专用冷却起点（区别于普通 setModel）
+            // 键＝解析后 provider/id（target 已解析），非池项 targetId
+            const think = applyThinkingTier(pi, `${target.provider}/${target.id}`, anchor?.tier ?? up.tier, cfg);
+            outcomes.midThreadUpgrades += 1;
+            appendLog({
+              ts: new Date().toISOString(), type: "mid_thread_upgrade",
+              from: curId, to: targetId, fromTier: curTier, toTier: up.tier,
+              landedTier: anchor?.tier ?? null, failStreak: toolFailStreak,
+              threshold: mt.failThreshold, gear,
+              thinkingLevel: think,
+            });
+            return; // 刚升过档——本轮不再判弃（新模型需一次机会证明自己）
+          }
+        }
       }
-      if (!ok) return;
-      upgradedThisTurn = true; // 每回合至多 1 次（防振荡）
-      lastUpgradeAt = Date.now(); // 升档专用冷却起点（区别于普通 setModel）
-      outcomes.midThreadUpgrades += 1;
+
+      // ② 尝试预算（ask-for-help）：升不动 / 升完仍连败 ⇒ 停止本回合并交还人
+      if (!attemptBudgetExhausted(cfg)) return;
+      gaveUpThisTurn = true;
+      outcomes.attemptsGaveUp += 1;
       appendLog({
-        ts: new Date().toISOString(), type: "mid_thread_upgrade",
-        from: curId, to: targetId, fromTier: curTier, toTier: up.tier,
-        failStreak: toolFailStreak, threshold: mt.failThreshold, gear,
+        ts: new Date().toISOString(), type: "attempt_budget_exhausted",
+        model: curId, tier: curTier, failStreak: toolFailStreak,
+        giveUpAfter: cfg.attemptBudget.giveUpAfter, upgradedThisTurn,
+        action: cfg.attemptBudget.stopTurn ? "abort_turn" : "notify_only", gear,
       });
+      if (cfg.attemptBudget.notify) {
+        const tip =
+          `尝试预算耗尽：连续 ${toolFailStreak} 次工具失败（阈值 ${cfg.attemptBudget.giveUpAfter}），` +
+          `当前 ${curTier} 档${upgradedThisTurn ? " 已升过档" : ""}仍失败 ⇒ 停止本回合。` +
+          `建议：/model 换更强模型、补充关键信息，或人工介入。`;
+        try {
+          if (ctx.hasUI) ctx.ui.notify(tip, "warning");
+          else process.stderr.write(`[router] ${tip}\n`);
+        } catch {
+        }
+      }
+      if (cfg.attemptBudget.stopTurn) ctx.abort();
     } catch (e) {
       appendLog({ ts: new Date().toISOString(), stage: "mid_thread", err: String(e).slice(0, 300) });
     }
@@ -1138,6 +1267,7 @@ export default function (pi: ExtensionAPI) {
     // Phase 3 ①：升级窗口仅限本回合——跨回合计数会把新回合的偶发失败误判为「连续」
     toolFailStreak = 0;
     upgradedThisTurn = false;
+    gaveUpThisTurn = false; // Phase 4：放弃标记同样按回合重置
     outcomes.turns += 1;
     if (lastTurnHadError) outcomes.retriedTurns += 1;
     // P2-4 后半：回合级 outcome 落盘（校准分类器的数据基础；用 decisionId 关联决策记录）

@@ -76,11 +76,25 @@ dimension drove a tier. `clsVersion` is stamped too, which matters for calibrati
 from different classifier versions live on different scales and must never be pooled.
 
 
-### Execution-time adaptation (Phase 3)
+### Execution-time adaptation (Phase 3 & 4)
+
+Two layers read the same signal — *consecutive* tool failures inside one turn — and run in
+order: try a stronger model first, and only give up when there is nothing left to try.
 
 - **Mid-thread upgrade** — three *consecutive* tool failures inside one turn mean the prompt was
   misclassified as easy; the router upgrades one tier (max once per turn, with cooldown). One
   success resets the streak: consecutive failures are the difficulty signal, sporadic ones are noise.
+  The upgrade target comes from `anchorFor()`, which walks the downgrade chain to the first tier
+  that has a candidate valid *right now* (the time gate is honoured), so an upgrade never lands on
+  a model that is unavailable at this hour.
+- **Attempt budget** — five consecutive failures mean retrying is not working. The router records
+  the decision, prints a notice and **ends the turn**, handing the problem back to you. Because the
+  upgrade may be spent only once per turn, without this layer a session that kept failing would
+  keep failing in silence. `graceAfterUpgradeSec` stops a freshly upgraded model from being written
+  off before it has had a chance to answer.
+- **Thinking level per tier** — `Fast` → `minimal`, `Balanced` → `medium`, `Performance` → `high`.
+  Applied only when this extension switched the model itself, so a manual `/thinking` is never
+  overridden, and an explicit per-model entry in `settings.modelThinkingLevels` wins over it.
 - **Sub-agent tiering** — the `subagent` tool's task is classified independently and the tier's
   anchor model is injected into `input.model`. An explicitly specified model is never overridden.
 - **Same-turn requeue** — when a model-level rate limit hits and rotation succeeded within the
@@ -169,6 +183,8 @@ objects are replaced shallowly — provide the full object when overriding.
 | `lanePref` | `{ code: [], knowledge: [] }` | In-tier preference per lane (`code` / `knowledge`) |
 | `midThread` | `{ enabled: true, failThreshold: 3, cooldownSec: 60 }` | Consecutive tool failures → 1-tier upgrade |
 | `subagentTier` | `{ enabled: true }` | Independent tiering of `subagent` tasks |
+| `attemptBudget` | `{ enabled: true, giveUpAfter: 5, notify: true, stopTurn: true, graceAfterUpgradeSec: 30 }` | Consecutive tool failures → record, notify and end the turn (ask-for-help). Keep `giveUpAfter` **above** `midThread.failThreshold` so upgrading is tried first |
+| `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | Thinking level applied after an extension-initiated switch (`minimal` / `low` / `medium` / `high` / `xhigh` / `max`). A manual `/thinking` or an explicit `modelThinkingLevels` entry takes precedence |
 | `errorFeedback.*` | see source | Rate-limit cooldowns + recent-error window (`recentErrorRateThreshold: 0.34`) |
 | `defaultProvider` | `""` | Provider fallback when `ctx.model` is unset at decision time |
 

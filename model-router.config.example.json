@@ -18,6 +18,17 @@
   "lanePref": { "code": [], "knowledge": [] },
   "midThread": { "enabled": true, "failThreshold": 3, "cooldownSec": 60 },
   "subagentTier": { "enabled": true },
+  "attemptBudget": {
+    "enabled": true,
+    "giveUpAfter": 5,
+    "notify": true,
+    "stopTurn": true,
+    "graceAfterUpgradeSec": 30
+  },
+  "thinkingTier": {
+    "enabled": true,
+    "byTier": { "Fast": "minimal", "Balanced": "medium", "Performance": "high" }
+  },
   "errorFeedback": {
     "enabled": true,
     "rateLimitCooldownSec": 180,

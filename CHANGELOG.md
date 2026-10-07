@@ -2,6 +2,43 @@
 
 Notable changes, newest first.
 
+## v0.13.0
+
+- **Fix: `PRICING_TTL_MS` was used but never defined.** The free-model cache check threw
+  `ReferenceError` on every call after the first, which silently disabled free-model
+  preference for the rest of the session (the throw is swallowed by the caller's `catch`).
+  The first call passes only because the cache is still `null` and short-circuits the check.
+  Defined the constant.
+
+- **Fix: `defaultProvider` was documented and consumed but missing from `DEFAULTS`.** It
+  therefore always read `undefined`; it is now declared alongside the other config keys.
+
+- **Time gate is applied in one place.** It used to be filtered inside the decision loop
+  only, while the mid-thread upgrade and the sub-agent tiering took their candidate
+  straight from the pool — so during the day those two paths could pick a time-gated model
+  and switch a struggling session onto a model that cannot serve it. The filter now lives
+  in `candidatesFor()`, and a new `anchorFor()` walks the downgrade chain to the first
+  usable tier, so every caller gets a candidate that is valid right now.
+
+- **Attempt budget (ask-for-help).** A second, orthogonal layer on top of the mid-thread
+  upgrade. `midThread` (threshold 3) swaps in a stronger model and keeps going;
+  `attemptBudget` (threshold 5) concludes that retrying is not working, records the
+  decision and **ends the turn** with a notice, handing the problem back to the user.
+  Without it, once the single permitted upgrade had been spent the agent just kept
+  retrying in silence. `graceAfterUpgradeSec` keeps a freshly upgraded model from being
+  written off before it has had a chance to answer. Configurable and switchable via
+  `attemptBudget`.
+
+- **Thinking level per tier.** `Fast` → `minimal`, `Balanced` → `medium`,
+  `Performance` → `high`. It is applied only when this extension switched the model
+  itself, so a manual `/thinking` is never overridden, and an explicit per-model entry in
+  `settings.modelThinkingLevels` takes precedence. Models without reasoning support are
+  clamped by pi.
+
+- Both layers read the same counter and run in the same `tool_result` handler, in order:
+  try the upgrade first, and only give up when there is nothing left to try. Two handlers
+  would mean two sources of truth for one signal.
+
 ## v0.12.1
 
 - **Fix: restore the classifier and configuration sections.** The v0.12.1 sync replaced a
