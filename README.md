@@ -95,6 +95,9 @@ order: try a stronger model first, and only give up when there is nothing left t
 - **Thinking level per tier** — `Fast` → `minimal`, `Balanced` → `medium`, `Performance` → `high`.
   Applied only when this extension switched the model itself, so a manual `/thinking` is never
   overridden, and an explicit per-model entry in `settings.modelThinkingLevels` wins over it.
+  That entry is keyed by the **resolved** `provider/modelId`, not by the pool-entry form: if your
+  pool lists `my-gateway/gpt-x` but pi resolves it under provider `myprovider`, the key is
+  `myprovider/my-gateway/gpt-x`. Using the pool form as the key silently fails to match.
 - **Sub-agent tiering** — the `subagent` tool's task is classified independently and the tier's
   anchor model is injected into `input.model`. An explicitly specified model is never overridden.
 - **Same-turn requeue** — when a model-level rate limit hits and rotation succeeded within the
@@ -180,6 +183,7 @@ objects are replaced shallowly — provide the full object when overriding.
 | `health.timeoutMs` / `ttlSec` | `600` / `60` | Probe timeout / cache TTL |
 | `channels` | `["your-provider"]` | Channel names matching pool entry prefixes and `/status` `accounts` keys |
 | `failover.cooldownSec` | `300` | Post-failure model cooldown (prevents two-model flip loops) |
+| `failover.primary` / `fallback` | placeholders | **Display-only** — shown by `/router status` for readability; real rotation follows pool order |
 | `lanePref` | `{ code: [], knowledge: [] }` | In-tier preference per lane (`code` / `knowledge`) |
 | `midThread` | `{ enabled: true, failThreshold: 3, cooldownSec: 60 }` | Consecutive tool failures → 1-tier upgrade |
 | `subagentTier` | `{ enabled: true }` | Independent tiering of `subagent` tasks |
@@ -187,6 +191,7 @@ objects are replaced shallowly — provide the full object when overriding.
 | `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | Thinking level applied after an extension-initiated switch (`minimal` / `low` / `medium` / `high` / `xhigh` / `max`). A manual `/thinking` or an explicit `modelThinkingLevels` entry takes precedence |
 | `errorFeedback.*` | see source | Rate-limit cooldowns + recent-error window (`recentErrorRateThreshold: 0.34`) |
 | `defaultProvider` | `""` | Provider fallback when `ctx.model` is unset at decision time |
+| `promptPreviewChars` | `300` | Prompt text kept in the decision log for audit; `0` keeps prompts off disk entirely |
 
 **Environment variables** (all optional):
 
@@ -204,7 +209,8 @@ objects are replaced shallowly — provide the full object when overriding.
 /router auto             release manual lock → automatic routing
 /router manual [modelId] lock the current (or a named) model
 /router shadow|active    record-only ↔ real switching (session scope)
-/router stats            in-process outcome counters (turns / errors / upgrades)
+/router stats            in-process counters: turns, errors, lane split, mid-thread upgrades,
+                         sub-agent tiering, attempts given up, thinking levels applied
 /router version          extension version
 ```
 

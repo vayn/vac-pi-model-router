@@ -84,7 +84,9 @@ classify()  ── 规则分层分类器：Fast / Balanced / Performance
   不会被立即判弃。
 - **档位→思考等级** —— `Fast` → `minimal`、`Balanced` → `medium`、`Performance` → `high`。
   只在**本扩展自己切模型**时施加，故手动 `/thinking` 永不被打断；settings 中针对具体模型的
-  `modelThinkingLevels` 显式配置优先级更高。
+  `modelThinkingLevels` 显式配置优先级更高。该配置的键是**解析后**的 `provider/modelId`，不是池项
+  写法：若池内写的是 `my-gateway/gpt-x`，而 pi 把它解析到 provider `myprovider` 之下，则键为
+  `myprovider/my-gateway/gpt-x`；用池项写法作键会静默匹配不上。
 - **子代理自动分档** —— `subagent` 工具的 task 文本被独立分类，其档位锚位模型注入
   `input.model`。显式指定 model 时绝不覆盖。
 - **同回合重发** —— 命中模型级限流且档内轮转成功后，重放原 prompt（带节流）。因为 pi 自身
@@ -165,6 +167,7 @@ pi install ~/pi-packages/model-router
 | `health.timeoutMs` / `ttlSec` | `600` / `60` | 探测超时 / 缓存 TTL |
 | `channels` | `["your-provider"]` | 通道名，需与池项前缀及 `/status` 的 `accounts` 键一致 |
 | `failover.cooldownSec` | `300` | 模型失败后冷却（防两模型来回跳）|
+| `failover.primary` / `fallback` | 占位符 | **仅展示语义** —— 由 `/router status` 显示以便阅读；实际轮转按池序 |
 | `lanePref` | `{ code: [], knowledge: [] }` | 档内泳道优先候选（`code` / `knowledge`）|
 | `midThread` | `{ enabled: true, failThreshold: 3, cooldownSec: 60 }` | 连续工具失败 → 升一档 |
 | `subagentTier` | `{ enabled: true }` | `subagent` 任务独立分档 |
@@ -172,6 +175,7 @@ pi install ~/pi-packages/model-router
 | `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | 本扩展切模型后施加的思考等级（`minimal` / `low` / `medium` / `high` / `xhigh` / `max`）。手动 `/thinking` 或 `modelThinkingLevels` 显式配置优先 |
 | `errorFeedback.*` | 见源码 | 限流冷却 + 近期错误窗口（`recentErrorRateThreshold: 0.34`）|
 | `defaultProvider` | `""` | 决策时 `ctx.model` 未设置时的 provider 兜底 |
+| `promptPreviewChars` | `300` | 决策日志中保留的 prompt 文本长度（审计用）；设为 `0` 则 prompt 完全不落盘 |
 
 **环境变量**（全部可选）：
 
@@ -189,7 +193,8 @@ pi install ~/pi-packages/model-router
 /router auto             解除手动锁 → 自动路由
 /router manual [modelId] 锁定当前（或指定）模型
 /router shadow|active    只记录 ↔ 真实切换（会话级）
-/router stats            进程内回合计数（回合 / 错误 / 升档）
+/router stats            进程内计数：回合、错误、泳道分布、mid-thread 升档、子代理分档、
+                         已放弃次数、已施加思考等级
 /router version          扩展版本
 ```
 

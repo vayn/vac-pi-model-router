@@ -35,6 +35,14 @@ Notable changes, newest first.
   `settings.modelThinkingLevels` takes precedence. Models without reasoning support are
   clamped by pi.
 
+- **Fix: the thinking-level lookup used the wrong key.** The "user configuration wins"
+  guarantee above was silently defeated: the lookup was passed the pool-entry form
+  (`<channel>/<model>`) while pi keys `modelThinkingLevels` by the resolved
+  `${provider}/${id}`. The two are not the same name — a pool entry `my-gateway/gpt-x`
+  resolved under provider `myprovider` is keyed `myprovider/my-gateway/gpt-x`. A missing key
+  is not an error, so a level you set was overridden with no signal. Both call sites now
+  pass the resolved form.
+
 - Both layers read the same counter and run in the same `tool_result` handler, in order:
   try the upgrade first, and only give up when there is nothing left to try. Two handlers
   would mean two sources of truth for one signal.
