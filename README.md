@@ -41,7 +41,9 @@ Every decision is logged with a full `gateChain` trace so it can be replayed off
 classify()  ── rule-based tier: Fast / Balanced / Performance
    │
    ├─ time gate          optional free-window model only at night
+   ├─ grey list          manually disabled models filtered out (unchanged pool)
    ├─ health gate ①      account-level gateway /status probe   (optional, fail-open)
+   ├─ channel breaker    channels whose upstream is down are dropped entirely
    ├─ health gate ②      model-level cooldown (rate-limit / unavailable windows)
    ├─ health gate ③      recent-error de-prioritization from outcome log
    ├─ failover cooldown  models that failed recently are skipped
@@ -53,6 +55,15 @@ classify()  ── rule-based tier: Fast / Balanced / Performance
 Gate ③ deserves a note: it **de-prioritizes** (moves a recently error-prone model to the end of the
 viable list) instead of removing it — "recently flaky" ≠ "currently unavailable", and hard removal
 can collapse a sparse pool into `no_viable`.
+
+The **channel breaker** fills a gap the account-level health gate cannot see: that probe reports
+whether *accounts* are available, so a channel whose *upstream* is broken can still read `ok` while
+every one of its models fails. Because a model-level cooldown only cools the single model that was
+named, the next rotation would pick a sibling model on the same broken channel and eat the same
+timeout again — which is how one outage presents itself as a run of consecutive truncations.
+Counting failures **per channel** and cooling the whole channel lets rotation move to a different
+channel instead. Note the breaker needs failures to *accumulate* (`failThreshold`), so it cannot
+make the first failing request faster; what it removes is the repetition that follows.
 
 ### How classification works
 
@@ -210,6 +221,9 @@ objects are replaced shallowly — provide the full object when overriding.
 | `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | Thinking level applied after an extension-initiated switch (`minimal` / `low` / `medium` / `high` / `xhigh` / `max`). A manual `/thinking` or an explicit `modelThinkingLevels` entry takes precedence |
 | `costGuard` | `{ enabled: true, shortPromptChars: 200, confirmUpgradeTiers: ["Performance"], confirmTimeoutSec: 120 }` | Free-first inside a tier unless the prompt is ≤ `shortPromptChars`; a paid escalation into `confirmUpgradeTiers` asks first. Decline / timeout / no UI ⇒ stay in the current tier |
 | `errorFeedback.*` | see source | Rate-limit cooldowns + recent-error window (`recentErrorRateThreshold: 0.34`) |
+| `channelBreaker` | `{ enabled: true, windowSec: 900, failThreshold: 3, cooldownSec: 900 }` | Channel-level circuit breaker: `failThreshold` failures from one channel inside `windowSec` trip the **whole channel** for `cooldownSec`. Covers the gap where a channel's upstream is down while the account-level health probe still reports `ok` |
+| `disabledModels` | `[]` | Inline disable-list — **fallback only**: used when `disabledModelsFile` is missing or unreadable |
+| `disabledModelsFile` | `"disabled-models.json"` | Disable-list file (relative to the extension dir). The file wins over the inline array. See [Grey models](#grey-models-manual-disable-list) |
 | `defaultProvider` | `""` | Provider fallback when `ctx.model` is unset at decision time |
 | `promptPreviewChars` | `300` | Prompt text kept in the decision log for audit; `0` keeps prompts off disk entirely |
 
@@ -221,6 +235,8 @@ objects are replaced shallowly — provide the full object when overriding.
 | `MODEL_ROUTER_STATE_DIR` | State/log dir — defaults to `~/.local/state/model-router` |
 | `MODEL_ROUTER_PRICING` | Overrides `pricing.file` (useful for migration and isolated tests) |
 | `MODEL_ROUTER_GATEWAY_CONFIG` | Path to a JSON file containing `api_key` for the health probe (credentials are never read unless set, and never written anywhere) |
+| `MODEL_ROUTER_DISABLED_MODELS` | Overrides `disabledModelsFile` (absolute path to the disable-list file) |
+| `MODEL_ROUTER_GATEWAY_URL` / `MODEL_ROUTER_GATEWAY_KEY` | Gateway base URL / API key for the standalone `tools/scan_grey_models.py` inspector (see [Grey models](#grey-models-manual-disable-list)); the extension itself does not use them |
 
 ## Commands
 
@@ -232,6 +248,8 @@ objects are replaced shallowly — provide the full object when overriding.
 /router stats            in-process counters: turns, errors, lane split, mid-thread upgrades,
                          sub-agent tiering, attempts given up, thinking levels applied,
                          cost-guard redirects / confirmations / declines
+/router grey             disable-list summary + how to run the recovery inspector
+/router grey-list        time-gate status of every disable-list entry (no network requests)
 /router version          extension version
 ```
 
@@ -296,7 +314,10 @@ model-router/
 ├── package.json                     # pi package manifest (pi.extensions)
 ├── extensions/model-router.ts       # the extension (single file, no runtime deps)
 ├── tools/router_calibrate.py        # offline read-only calibration report (python3 stdlib)
+├── tools/scan_grey_models.py        # disable-list recovery inspector (read-only, python3 stdlib)
+├── tools/channel_breaker_selftest.mjs # circuit-breaker + disable-list truth tables (node)
 ├── model-router.config.example.json # copy to ~/.pi/agent/model-router.config.json
+├── disabled-models.json             # grey-model list (template; see note)
 ├── free-exclusions.json             # optional free-model coverage contract (see note)
 ├── CHANGELOG.md
 ├── LICENSE
@@ -309,6 +330,81 @@ model-router/
 models (e.g. `free=true` with `rate=0`), every one of them must either appear in a pool or in this
 exclusion table with evidence — so newly added free models can't be silently ignored. The extension
 itself does not read this file; it exists for your own gates/audits.
+
+## Grey models (manual disable list)
+
+A **grey model** is one you have decided not to route to *for now* — typically a quota-exhausted
+or rate-limited model that is expected to recover on its own. Greying a model filters it out of the
+candidate chain **without changing the pool**, so `/router status` and the pool order still show it.
+
+This is deliberately distinct from two neighbours:
+
+| Mechanism | Nature | Lifetime | Where it lives |
+|---|---|---|---|
+| **Grey list** | manual judgement | temporary (expected recovery) | `disabled-models.json` |
+| **Channel breaker** | automatic, self-healing | runtime cooling window | `channel-breaker-state.json` |
+| **Exclusion table** | manual judgement | permanent (provider gone) | `free-exclusions.json` + remove from pool |
+
+### Why the list is a file, not an inline array
+
+`disabledModels` still exists in `DEFAULTS`, but only as a **fallback** for when the file is absent.
+The list is a file because it usually has **more than one consumer** — this extension, plus anything
+else you build on top (a frontend that greys these entries out, a monitoring job). An inline array
+lives inside the extension's source; anything outside it cannot read that, so each consumer would
+have to keep its own copy — and two copies of one list is a correctness bug waiting to happen.
+
+### The file
+
+```json
+{
+  "schema": "disabled-models-v1",
+  "updatedAt": "2026-01-01T00:00:00+00:00",
+  "models": [
+    { "id": "my-provider/my-model",   "reason": "quota exhausted", "reviewAt": "2026-01-01T08:00:00+00:00" },
+    { "id": "flaky-provider/*",        "reason": "channel outage",  "reviewAt": null }
+  ]
+}
+```
+
+- `id` — `<provider>/<modelId>`, or `<provider>/*` to disable a whole channel.
+- `reviewAt` — the moment the entry becomes worth re-checking. Take it from whatever the upstream
+  *itself* states: a `429` body usually names its own reset time (e.g. *"resets at 08:00 UTC+8"*).
+  `null` means there is no declared recovery point (channel outage, free-tier throttling) and the
+  entry is treated as re-checkable at any time.
+- Entries may also be plain strings (`"my-provider/my-model"`) if you do not need the metadata.
+
+The file is read with an **mtime cache**: it is hand-edited, so a change should take effect on the
+very next decision. A TTL would keep serving the old list for the length of the window.
+
+### Recovery inspection (semi-manual by design)
+
+```bash
+python3 tools/scan_grey_models.py             # probe only what is due
+python3 tools/scan_grey_models.py --list      # show due-time status, no requests
+python3 tools/scan_grey_models.py --all       # ignore reviewAt, probe everything
+python3 tools/scan_grey_models.py --self-test # due-time truth table (no network)
+```
+
+**Not-yet-due entries are skipped with zero network requests.** Probing before `reviewAt` is
+*guaranteed* to fail and therefore carries no information — it only burns quota and wall-clock time.
+Provide the API key via `MODEL_ROUTER_GATEWAY_KEY` or `MODEL_ROUTER_GATEWAY_CONFIG`; point the tool at
+your gateway with `MODEL_ROUTER_GATEWAY_URL`. Pass `--pool-file` (one `<provider>/<model>` per line)
+if you want `<provider>/*` entries expanded into concrete models.
+
+Availability is a **random variable, not a boolean** — the same model can return `429` and `200`
+within the same minute. So the verdict is based on a **success rate**: one `200` anywhere is enough
+to avoid declaring a model dead, and only deterministic failures count against it. The exit codes
+follow the same convention as the sibling health checks (see `--json` for machine-readable output):
+
+| Exit | Meaning |
+|---|---|
+| `0` | nothing recovered, or everything not yet due |
+| `10` | at least one entry looks recovered — remove it from the list by hand |
+| `2` | could not load the list or reach the gateway |
+
+The tool **never edits the list for you.** A single lucky `200` is not proof of recovery, and letting
+a script silently promote that into a configuration change is exactly the failure mode this design
+avoids. The machine gathers evidence; a human makes the call.
 
 ## Calibration workflow
 

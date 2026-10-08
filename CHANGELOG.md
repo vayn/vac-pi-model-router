@@ -2,6 +2,46 @@
 
 Notable changes, newest first.
 
+## v0.15.0
+
+- **Channel-level circuit breaker.** A model-level cooldown only cools the single model that was
+  named, so when a *channel's upstream* is broken the next rotation picks a sibling model on the same
+  channel and eats the same timeout — one outage presents itself as a run of consecutive truncations.
+  The account-level health probe cannot catch this either: it reports whether *accounts* are
+  available, so a channel with a dead upstream can still read `ok`. Failures are now counted **per
+  channel** (`channelBreaker.windowSec` / `failThreshold`), and crossing the threshold trips the whole
+  channel for `cooldownSec`. State lives in `channel-breaker-state.json`; a failure arriving while
+  tripped does **not** extend the window (otherwise a permanently failing channel could never earn a
+  fresh self-check). Note the threshold must *accumulate*, so this cannot make the first failing
+  request faster — what it removes is the repetition after it.
+- **Grey models — a manual disable list** (`disabled-models.json`): temporarily stop routing to a
+  model *without* changing the pool, so `/router status` and the pool order still show it. Intended
+  for quota-exhausted or rate-limited models that are expected to recover; permanent removals still
+  belong in `free-exclusions.json` plus a pool edit. Previously the list was an inline array
+  (`disabledModels`), which only this extension could read; it is now a file because a list like this
+  usually has more than one consumer, and two copies of one list is a correctness bug waiting to
+  happen. `disabledModels` remains as the fallback when the file is absent. Entries support
+  `<provider>/*` to disable a whole channel and an optional `reviewAt` for the re-check moment; the
+  file is read through an **mtime** cache, since it is hand-edited and a change should take effect at
+  once.
+- **`/router grey` and `/router grey-list`.** `grey` prints the disable list plus how to run the
+  recovery inspector; `grey-list` prints each entry's due-time status with **zero network requests**.
+  `/router status` gained grey / breaker / exclusion lines, so the three layers — manual-and-temporary,
+  automatic-and-self-healing, permanent — are visible side by side.
+- **`tools/scan_grey_models.py`** — a recovery inspector, semi-manual by design. Before `reviewAt` a
+  probe is *guaranteed* to fail and carries no information, so those entries are skipped with zero
+  requests. Availability is a random variable, not a boolean, so the verdict uses a success rate
+  (one `200` is enough to avoid declaring a model dead) and the tool **never edits the list for
+  you** — it only reports what looks recovered. Exit `10` means "something recovered, remove it by
+  hand"; `--self-test` runs the due-time truth table with no network.
+- **`tools/channel_breaker_selftest.mjs`** — truth tables for the breaker and the disable list
+  (20 assertions: threshold behaviour, no window extension, expiry, sliding-window edges, channel
+  isolation, `disabled: false` short-circuit, empty channel name, persistence round-trip, plus
+  exact-vs-wildcard matching and the shared-prefix channel trap).
+- **Config:** `channelBreaker`, `disabledModels`, `disabledModelsFile`; a `disabled-models.json`
+  template; and `MODEL_ROUTER_DISABLED_MODELS` as an override. Both READMEs document the disable
+  list, its neighbours, and the semi-manual recovery workflow.
+
 ## v0.14.0
 
 - **Cost guard — two rules so automatic tier switching cannot spend money silently.**

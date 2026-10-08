@@ -39,7 +39,9 @@
 classify()  ── 规则分层分类器：Fast / Balanced / Performance
    │
    ├─ 时段闸            限免模型仅夜间可选
+   ├─ 灰名单            人工禁用的模型被剔除（不改池构成）
    ├─ 健康闸 ①          账号级：网关 /status 探测     （可选，fail-open）
+   ├─ 渠道熔断          上游挂掉的渠道整体剔除
    ├─ 健康闸 ②          模型级：限流 / 不可用冷却窗
    ├─ 健康闸 ③          频次级：按近期错误率降权
    ├─ failover 冷却      近期失败过的模型跳过
@@ -50,6 +52,12 @@ classify()  ── 规则分层分类器：Fast / Balanced / Performance
 
 健康闸 ③ 值得说明：它对近期易错模型是**降权**（挪到可行列表末尾）而非剔除 ——
 「近期常错」不等于「当前不可用」，硬剔除会把稀疏的候选池逼向 `no_viable`。
+
+**渠道熔断**补的是账号级健康闸的盲区：那一层探的是**账号**是否可用，所以一个**上游整体挂掉**
+的渠道仍可能报 `ok`，而它的每个模型都在失败。又因为模型级冷却只冷却**被点名的单个模型**，
+下次轮转会选到同渠道的兄弟模型、再吃一次同样的超时 —— 一次故障就这样表现为「连续多次截断」。
+按**渠道**累计失败并冷却整渠道，轮换才能落到别的渠道。注意熔断需要失败**累计**到阈值
+（`failThreshold`），所以它**不能让第一个失败请求变快**；它消除的是其后的重复。
 
 ### 分类器如何工作
 
@@ -189,6 +197,9 @@ pi install ~/pi-packages/model-router
 | `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | 本扩展切模型后施加的思考等级（`minimal` / `low` / `medium` / `high` / `xhigh` / `max`）。手动 `/thinking` 或 `modelThinkingLevels` 显式配置优先 |
 | `costGuard` | `{ enabled: true, shortPromptChars: 200, confirmUpgradeTiers: ["Performance"], confirmTimeoutSec: 120 }` | 同档内免费优先（极短 prompt 除外）；付费升入 `confirmUpgradeTiers` 前先征询。拒绝 / 超时 / 无 UI ⇒ 留在当前档 |
 | `errorFeedback.*` | 见源码 | 限流冷却 + 近期错误窗口（`recentErrorRateThreshold: 0.34`）|
+| `channelBreaker` | `{ enabled: true, windowSec: 900, failThreshold: 3, cooldownSec: 900 }` | 渠道级熔断：同一渠道在 `windowSec` 内失败达 `failThreshold` ⇒ 冷却**整渠道** `cooldownSec`。补的是「渠道上游挂掉、而账号级健康闸仍报 `ok`」这一盲区 |
+| `disabledModels` | `[]` | 内联禁用清单 —— **仅作回退**：`disabledModelsFile` 缺失或不可读时使用 |
+| `disabledModelsFile` | `"disabled-models.json"` | 灰名单文件（相对扩展目录）。文件优先于内联数组。见「灰名单」节 |
 | `defaultProvider` | `""` | 决策时 `ctx.model` 未设置时的 provider 兜底 |
 | `promptPreviewChars` | `300` | 决策日志中保留的 prompt 文本长度（审计用）；设为 `0` 则 prompt 完全不落盘 |
 
@@ -200,6 +211,8 @@ pi install ~/pi-packages/model-router
 | `MODEL_ROUTER_STATE_DIR` | 状态/日志目录 —— 默认 `~/.local/state/model-router` |
 | `MODEL_ROUTER_PRICING` | 覆盖 `pricing.file`（便于迁移与隔离测试）|
 | `MODEL_ROUTER_GATEWAY_CONFIG` | 含 `api_key` 的健康探测配置 JSON 路径（未设置则不读取任何凭据，且凭据绝不写入任何地方）|
+| `MODEL_ROUTER_DISABLED_MODELS` | 覆盖 `disabledModelsFile`（灰名单文件的绝对路径）|
+| `MODEL_ROUTER_GATEWAY_URL` / `MODEL_ROUTER_GATEWAY_KEY` | 独立巡检脚本 `tools/scan_grey_models.py` 用的网关基址 / API key（见「灰名单」节）；扩展本体不用它们 |
 
 ## 命令
 
@@ -210,6 +223,8 @@ pi install ~/pi-packages/model-router
 /router shadow|active    只记录 ↔ 真实切换（会话级）
 /router stats            进程内计数：回合、错误、泳道分布、mid-thread 升档、子代理分档、
                          已放弃次数、已施加思考等级、成本护栏改走免费/已确认/被拒次数
+/router grey             灰名单摘要 + 恢复巡检的运行方式
+/router grey-list        逐条列出灰名单的时点状态（零网络请求）
 /router version          扩展版本
 ```
 
@@ -268,7 +283,10 @@ model-router/
 ├── package.json                     # pi 包清单（pi.extensions）
 ├── extensions/model-router.ts       # 扩展本体（单文件，无运行时依赖）
 ├── tools/router_calibrate.py        # 离线只读校准报告（python3 标准库）
+├── tools/scan_grey_models.py        # 灰名单恢复巡检（只读，python3 标准库）
+├── tools/channel_breaker_selftest.mjs # 渠道熔断 + 灰名单真值表自测（node）
 ├── model-router.config.example.json # 复制为 ~/.pi/agent/model-router.config.json
+├── disabled-models.json             # 灰名单（模板）
 ├── free-exclusions.json             # 可选的免费模型覆盖契约（见下）
 ├── CHANGELOG.md
 ├── LICENSE
@@ -280,6 +298,75 @@ model-router/
 `free-exclusions.json` 实现一个可选的治理契约：若你的网关声明了免费模型（如 `free=true` 且
 `rate=0`），每一个都必须出现在某个候选池中，或出现在本排除表并附证据 —— 这样网关新增免费模型
 就不会被静默忽略。扩展本身不读取此文件；它供你自己的门禁/审计使用。
+
+## 灰名单（人工禁用清单）
+
+**灰名单模型** = 你决定**暂时**不路由过去的模型 —— 典型是额度耗尽或限流的模型，预期会自行恢复。
+把模型置灰会把它从候选链中剔除，但**不改变池构成**，故 `/router status` 与池内顺序仍能看到它。
+
+它刻意与两个邻居区分开：
+
+| 机制 | 性质 | 生命周期 | 载体 |
+|---|---|---|---|
+| **灰名单** | 人工判定 | 临时（预期恢复）| `disabled-models.json` |
+| **渠道熔断** | 自动、自愈 | 运行时冷却窗 | `channel-breaker-state.json` |
+| **排除表** | 人工判定 | 永久（provider 下架）| `free-exclusions.json` + 移出池 |
+
+### 为什么是文件而不是内联数组
+
+`DEFAULTS` 里的 `disabledModels` 仍保留，但仅作**回退值**（文件缺失时用）。名单之所以是文件，
+是因为它通常**不止一个消费方** —— 本扩展，加上你在其之上搭的其他东西（例如把灰项灰显的前端、
+监控任务）。内联数组活在扩展源码里，外部读不到，于是每个消费方都只能各存一份拷贝 ——
+而同一份名单存在两份拷贝，就是一个等着发生的正确性缺陷。
+
+### 文件格式
+
+```json
+{
+  "schema": "disabled-models-v1",
+  "updatedAt": "2026-01-01T00:00:00+00:00",
+  "models": [
+    { "id": "my-provider/my-model",  "reason": "额度耗尽", "reviewAt": "2026-01-01T08:00:00+00:00" },
+    { "id": "flaky-provider/*",      "reason": "渠道故障", "reviewAt": null }
+  ]
+}
+```
+
+- `id` —— `<provider>/<modelId>`，或 `<provider>/*` 禁用整渠道。
+- `reviewAt` —— 该条目值得重新检查的时刻。取值应来自**上游自己的声明**：`429` 响应体通常写明
+  自己何时重置（如「将在 08:00:00 UTC+8 重置」）。`null` 表示无声明的恢复时点（渠道故障、
+  免费档限流），巡检视其为**可随时复检**。
+- 若不需要元数据，条目也可直接写成字符串（`"my-provider/my-model"`）。
+
+文件按 **mtime 缓存**读取：它是手工编辑的，改动应在下一次决策即生效。用 TTL 会在窗口期内
+继续沿用旧名单。
+
+### 恢复巡检（刻意设计为半人工）
+
+```bash
+python3 tools/scan_grey_models.py             # 只探测已到点的项
+python3 tools/scan_grey_models.py --list      # 只看时点状态，零请求
+python3 tools/scan_grey_models.py --all       # 忽略 reviewAt，全量探测
+python3 tools/scan_grey_models.py --self-test # 时点判定真值表（零网络）
+```
+
+**未到点的条目会被跳过，且零网络请求。** 在 `reviewAt` 之前探测是**必然失败**的，因而不携带任何
+信息量 —— 只是白白消耗配额与等待时间。凭据经 `MODEL_ROUTER_GATEWAY_KEY` 或
+`MODEL_ROUTER_GATEWAY_CONFIG` 提供；用 `MODEL_ROUTER_GATEWAY_URL` 指向你的网关。若想让
+`<provider>/*` 条目展开为具体模型，可传 `--pool-file`（每行一个 `<provider>/<model>`）。
+
+可用性是**随机量而非布尔值** —— 同一模型在同一分钟内可能既 `429` 又 `200`。故判定基于**成功率**：
+只要出现过一次 `200` 就不判死，只有确定性失败才计入。退出码与同类健康巡检同一约定
+（机器可读输出见 `--json`）：
+
+| 退出码 | 含义 |
+|---|---|
+| `0` | 无已恢复项，或全部尚未到点 |
+| `10` | 至少一项看似已恢复 —— 请人工将其从名单移除 |
+| `2` | 名单读取失败或网关不可达 |
+
+该工具**绝不替你修改名单**。一次幸运的 `200` 不是恢复的证明；让脚本把这种偶然静默提升为配置变更，
+正是本设计要避开的失效模式。机器负责取证，人负责决定。
 
 ## 校准工作流
 

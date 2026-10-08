@@ -44,6 +44,14 @@
     "recentErrorMinSamples": 3,
     "recentErrorRateThreshold": 0.34
   },
+  "channelBreaker": {
+    "enabled": true,
+    "windowSec": 900,
+    "failThreshold": 3,
+    "cooldownSec": 900
+  },
+  "disabledModels": [],
+  "disabledModelsFile": "disabled-models.json",
   "defaultProvider": "",
   "promptPreviewChars": 300
 }

@@ -1,0 +1,6 @@
+{
+  "schema": "disabled-models-v1",
+  "note": "人工禁用（灰色不可选）名单——模板。契约：本文件是**单真源**，model-router 扩展、外围前端（若要灰显）、恢复巡检脚本都读它。条目形：models[] 内每项为 { \"id\": \"<provider>/<model>\", \"reason\": \"...\", \"detail\": \"...\", \"reviewAt\": \"ISO8601|null\", \"reviewSource\": \"...\" }。id 支持 \"<provider>/*\" 通配（整渠道禁用）。reviewAt = 上游声明的额度重置时刻；null 表示无声明恢复点（渠道故障、免费档限流等），届时巡检视其为「可随时复检」。三层语义分层：① 灰色（本文件）= 人工判定、临时态，不改池构成；② 渠道熔断 = 自动自愈、运行时态；③ 排除表（free-exclusions.json）= 永久不可用，移出池 + 登记。",
+  "updatedAt": "",
+  "models": []
+}

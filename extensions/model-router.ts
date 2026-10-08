@@ -50,7 +50,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // ---------- 配置 ----------
@@ -174,6 +174,31 @@ const DEFAULTS = {
     recentErrorMinSamples: 3,   // 窗口内至少 N 个样本才启用降权（防小样本噪声）
     recentErrorRateThreshold: 0.34, // 错误率超此值 ⇒ 该模型近期不健康
   },
+  // 渠道级熔断（v0.15.0）：滑窗内同渠道失败达阈值 ⇒ 冷却整渠道。
+  // 【动因】模型级冷却（`failover.cooldownSec`）只冷却**被点名的单个模型**；渠道上游整体
+  //   故障时，池内同渠道的另一模型仍可被选中 ⇒ 轮转回去必再吃同一超时，表现为「连续多次
+  //   截断」。实测某渠道全 4 模型均 60s 后 HTTP502 `unexpected EOF`（而 /status 健康闸只
+  //   看**账号**级 available，看不见渠道整体挂，仍报 ok）。
+  // 【边界】熔断需真实失败**累计**达阈值才触发，故它把「多次超时串联」压成「首次触发后
+  //   同渠道全剔除」，**无法让第一个故障请求变快**。
+  channelBreaker: {
+    enabled: true,
+    windowSec: 900, // 统计最近 15 分钟内的渠道失败次数
+    failThreshold: 3, // 同渠道累计失败 3 次 ⇒ 熔断
+    cooldownSec: 900, // 熔断持续 15 分钟（长于模型级冷却，覆盖渠道恢复所需时间）
+  },
+  // 人工禁用（“灰色”不可选）：把临时不可用的模型从候选链剔除，但**不改池构成**，
+  //   `/router status` 与池内顺序仍可见 —— 适用于额度耗尽/限流（临时态，预计自行恢复）。
+  //   与「移出池 + 排除表」的区别：后者用于**永久**不可用（provider 下架）。
+  //   与「渠道熔断」的区别：灰色是**人工**判定（需人来判断是否恢复），熔断是**自动**自愈。
+  //
+  // 【外置单真源】灰名单由本文件的外置 JSON 文件承载（默认同目录 `disabled-models.json`），
+  //   因为消费方不止本扩展——若你的部署还有前端/巡检脚本要读同一份名单，内联数组它们够不到，
+  //   删除线之类的外围标识就只能另维一份清单 = 真源分裂。
+  //   `disabledModels` 仅作 **fixture / 无该 JSON 文件时的回退值**。
+  disabledModels: [] as string[],
+  // 灰名单文件路径（相对本扩展目录）。存在则优先于上面的内联数组。
+  disabledModelsFile: "disabled-models.json",
 };
 
 type Tier = keyof typeof DEFAULTS.pool;
@@ -391,6 +416,62 @@ function freeFirst(models: string[], c: Cfg): string[] {
 }
 function channelOf(modelId: string) {
   return modelId.split("/")[0] ?? "";
+}
+
+// ---------- 人工禁用（“灰色”不可选）----------
+
+/** 灰名单文件绝对路径（供 /router grey* 展示与外部脚本提示）。 */
+function disabledModelsPath(c: Cfg): string {
+  const rel = c.disabledModelsFile || "disabled-models.json";
+  return (
+    process.env.MODEL_ROUTER_DISABLED_MODELS ||
+    fileURLToPath(new URL(`../${rel}`, import.meta.url))
+  );
+}
+
+/** 灰名单完整条目（含 reason/reviewAt），供展示用；解析失败退化为裸 id 列表。 */
+function disabledEntries(c: Cfg): Array<{ id: string; reason?: string; reviewAt?: string | null }> {
+  try {
+    const doc = JSON.parse(readFileSync(disabledModelsPath(c), "utf8")) as {
+      models?: Array<{ id?: string; reason?: string; reviewAt?: string | null } | string>;
+    };
+    return (doc.models ?? [])
+      .map((m) => (typeof m === "string" ? { id: m } : { id: m?.id ?? "", reason: m?.reason, reviewAt: m?.reviewAt }))
+      .filter((e) => e.id.length > 0);
+  } catch {
+    return disabledList(c).map((id) => ({ id }));
+  }
+}
+
+/** 灰名单单真源（外置文件）——带 mtime 缓存。
+ *  为何缓存按 mtime 而非 TTL：灰名单是**人工编辑**的文件，改完即期望立即生效；
+ *  TTL 会在窗口内沿用旧值（同定价缓存按指纹分键的设计动机）。
+ *  读不到文件 ⇒ 回退 DEFAULTS.disabledModels（无该文件时靠内联数组）。 */
+let disabledCache: { mtimeMs: number; list: string[] } | null = null;
+
+function disabledList(c: Cfg): string[] {
+  const p = disabledModelsPath(c);
+  try {
+    const st = statSync(p);
+    if (disabledCache && disabledCache.mtimeMs === st.mtimeMs) return disabledCache.list;
+    const doc = JSON.parse(readFileSync(p, "utf8")) as { models?: Array<{ id?: string } | string> };
+    const list = (doc.models ?? [])
+      .map((m) => (typeof m === "string" ? m : (m?.id ?? "")))
+      .filter((x): x is string => typeof x === "string" && x.length > 0);
+    disabledCache = { mtimeMs: st.mtimeMs, list };
+    return list;
+  } catch {
+    return c.disabledModels ?? []; // 文件缺失/非法 ⇒ 回退内联数组（fail-safe）
+  }
+}
+
+/** 人工禁用（灰色）判定：精确匹配或 `"<渠道>/*"` 通配。
+ *  注意 slice(0,-2) 去掉末尾的 `"/*"`（仅去 `*` 会残留 `/` 导致永不匹配）。 */
+function isDisabled(modelId: string, c: Cfg): boolean {
+  const list = disabledList(c);
+  if (list.length === 0) return false;
+  const ch = channelOf(modelId);
+  return list.some((p) => p === modelId || (p.endsWith("/*") && p.slice(0, -2) === ch));
 }
 
 async function probeHealth(c: Cfg): Promise<HealthResult> {
@@ -702,8 +783,11 @@ function candidatesFor(tier: Tier, night: boolean, c: Cfg): string[] {
   // 若只在 decide() 过滤，那两条路径白天会拿到夜间限免模型，升档即撞限流（升到一个用不了的模型）。
   // Performance 池被剔空 → 调用方自然级联降档 Balanced（级联兜底，无需在此特判）。
   const usable = c.pool[tier].filter((m) => !(m === c.timeGate.model && !night));
+  // 人工禁用（灰色）在此过滤：本函数是 decide 主链 / mid-thread 升档 / 子代理分档的
+  // **唯一候选真相源**——只在一个地方消费，旁路就仍会选中灰模型。
+  const enabled = usable.filter((m) => !isDisabled(m, c));
   // Free models first within a tier; order within each group is preserved.
-  return freeFirst(usable, c);
+  return freeFirst(enabled, c);
 }
 
 /** 沿降档链取首个非空锚位——升档/子代理注入的唯一取模入口（保证拿到的是当前时段可用者）。 */
@@ -735,6 +819,9 @@ function freeCandidateInTier(tier: Tier, night: boolean, c: Cfg, health: HealthR
   for (const m of candidatesFor(tier, night, c)) {
     if (!free.has(m)) continue;
     if (health.status === "ok" && health.channels[channelOf(m)] === false) continue;
+    // 渠道级熔断：熔断中渠道的模型不算「可用免费候选」，
+    //   否则会把决策从「可用付费」退化成「不可用免费」。
+    if (isChannelTripped(channelOf(m), c)) continue;
     if (isCooling(m) || isErrorCooling(m)) continue;
     return m;
   }
@@ -894,8 +981,18 @@ async function decide(
     const viable0 =
       health.status === "ok" ? cands.filter((m) => health.channels[channelOf(m)] !== false) : cands;
     if (viable0.length < cands.length) chain.push(`filtered_by_health:${cands.length}->${viable0.length}`);
+    // 渠道级熔断：账号级健康闸（health.channels）看不见「渠道上游整体挂」——
+    //   它只反映账号 available，渠道级 502/EOF 时仍可能报 ok。故在此剔除熔断中渠道的
+    //   全部模型，使轮转自然落到其他渠道而非反复吃同一超时。
+    //   注：健康闸已报该渠道 false 时（viable0 已剔除）无需重复过滤，避免 chain 噪声。
+    const cbCfg = channelBreakerCfg(c);
+    const viableCB =
+      cbCfg.enabled && health.status !== "ok"
+        ? viable0.filter((m) => !isChannelTripped(channelOf(m), c))
+        : viable0;
+    if (viableCB.length < viable0.length) chain.push(`filtered_by_channel_breaker:${viable0.length}->${viableCB.length}`);
     // failover 冷却中的模型不可选（含 in_tier_hold 的 current 自身）
-    const viable1 = viable0.filter((m) => !isCooling(m));
+    const viable1 = viableCB.filter((m) => !isCooling(m));
     if (viable1.length < viable0.length) chain.push(`filtered_by_failover:${viable0.length}->${viable1.length}`);
     // P2-1：错误反馈短窗中的模型不可选（模型级限流，/status 健康闸盲区补偿）
     const viable = viable1.filter((m) => !isErrorCooling(m));
@@ -970,6 +1067,90 @@ function persistFailState() {
 function isCooling(modelId: string): boolean {
   const u = failState.get(modelId);
   return !!u && Date.now() < u;
+}
+
+// ---------- 渠道级熔断（v0.15.0）----------
+// 缺陷：模型级冷却（markFailed）只冷却**被点名的单个模型**，渠道整体挂时池内同渠道
+//   另一模型仍可被选中 ⇒ 轮转回去必再吃同一超时，表现为「连续多次截断」。
+// 处置：同渠道在滑窗内累计失败达阈值 ⇒ 冷却**整渠道**（含未被直接点名的同渠道模型），
+//   使轮转自然落到其他渠道；渠道级熔断只护轮转，与模型级冷却互不覆盖。
+const CHANNEL_BREAKER_STATE_PATH = join(STATE_DIR, "channel-breaker-state.json");
+
+/** 渠道熔断判定配置（默认值可在 Cfg.channelBreaker 覆盖）。 */
+const CHANNEL_BREAKER_DEFAULT = {
+  enabled: true,
+  windowSec: 900, // 滑窗：统计最近 15 分钟内的渠道失败次数
+  failThreshold: 3, // 同渠道累计失败达 3 次 ⇒ 熔断整渠道
+  cooldownSec: 900, // 熔断持续时长；过期自动恢复（渠道级冷却长于模型级）
+};
+
+interface ChannelBreakerCfg {
+  enabled: boolean;
+  windowSec: number;
+  failThreshold: number;
+  cooldownSec: number;
+}
+
+type FailRecord = { fails: number[]; until: number };
+
+function loadChannelBreaker(): Map<string, FailRecord> {
+  try {
+    const raw = JSON.parse(readFileSync(CHANNEL_BREAKER_STATE_PATH, "utf8")) as Record<string, FailRecord>;
+    const m = new Map<string, FailRecord>();
+    const now = Date.now();
+    for (const [k, v] of Object.entries(raw)) {
+      const fails = (v.fails ?? []).filter((t) => now - t < 24 * 3600 * 1000); // 只留 24h 内
+      const until = (v.until ?? 0) > now ? v.until : 0;
+      if (fails.length || until) m.set(k, { fails, until });
+    }
+    return m;
+  } catch {
+    return new Map();
+  }
+}
+
+const channelState: Map<string, FailRecord> = loadChannelBreaker();
+
+function persistChannelBreaker() {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+    const obj: Record<string, FailRecord> = {};
+    for (const [k, v] of channelState) obj[k] = v;
+    writeFileSync(CHANNEL_BREAKER_STATE_PATH, JSON.stringify(obj), { mode: 0o600 });
+  } catch {
+    /* 状态持久化失败不阻断 */
+  }
+}
+
+function channelBreakerCfg(c: Cfg): ChannelBreakerCfg {
+  return { ...CHANNEL_BREAKER_DEFAULT, ...(c.channelBreaker ?? {}) };
+}
+
+/** 渠道是否处于熔断冷却中。 */
+function isChannelTripped(channel: string, c: Cfg): boolean {
+  const cfg = channelBreakerCfg(c);
+  if (!cfg.enabled || !channel) return false;
+  const rec = channelState.get(channel);
+  return !!rec && rec.until > Date.now();
+}
+
+/** 记录一次渠道失败；达阈值则熔断整渠道。返回是否本次触发了熔断。 */
+function markChannelFailed(channel: string, c: Cfg): boolean {
+  const cfg = channelBreakerCfg(c);
+  if (!cfg.enabled || !channel) return false;
+  const now = Date.now();
+  const rec = channelState.get(channel) ?? { fails: [], until: 0 };
+  rec.fails = rec.fails.filter((t) => now - t < cfg.windowSec * 1000);
+  rec.fails.push(now);
+  let tripped = false;
+  // 熔断期内新增失败**不延长** until——否则持续失败会让渠道永远无法恢复自检。
+  if (rec.until <= now && rec.fails.length >= cfg.failThreshold) {
+    rec.until = now + cfg.cooldownSec * 1000;
+    tripped = true;
+  }
+  channelState.set(channel, rec);
+  persistChannelBreaker();
+  return tripped;
 }
 
 function markFailed(modelId: string, c: Cfg) {
@@ -1470,6 +1651,17 @@ export default function (pi: ExtensionAPI) {
           detail: ef.window.detail, gear,
         });
       }
+      // 渠道级熔断计数：**先于**模型级冷却统计，使渠道整体故障时同渠道其他模型一并被
+      //   排除（仅靠 markFailed 只能冷却被点名的单个模型）。统计范围含越池模型
+      //   （渠道级判据不应局限于池内）。
+      const chOf = channelOf(cur);
+      const tripped = markChannelFailed(chOf, cfg);
+      if (tripped) {
+        appendLog({
+          ts: new Date().toISOString(), type: "failover", from: cur,
+          decision: "channel_tripped", reason: `channel_failure_threshold:${chOf}`,
+        });
+      }
       // P2-2：池内轮转（failover 对内相邻语义保留）；越池模型不碰
       if (!tierOf(cur, cfg)) return;
       markFailed(cur, cfg); // 池内模型错误即冷却，防轮转回弹
@@ -1573,7 +1765,7 @@ export default function (pi: ExtensionAPI) {
 
   // /router —— 挡位与模式管理
   pi.registerCommand("router", {
-    description: "Model Router 挡位管理：status | auto | manual [model] | shadow | active | stats | version",
+    description: "Model Router 挡位管理：status | auto | manual [model] | shadow | active | stats | grey | grey-list | version",
     handler: async (args, ctx) => {
       const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
       const sub = parts[0] ?? "status";
@@ -1612,6 +1804,41 @@ export default function (pi: ExtensionAPI) {
         }
       } else if (sub === "stats") {
         msg = statsMessage(cfg);
+      } else if (sub === "grey" || sub === "scan-grey") {
+        // 灰名单恢复巡检（“到点就巡查确认，没到点就自动忽略，半人工核实”）。
+        // 实现不在此重写探针：本处仅展示摘要与时点筛选结果（单一真相在巡检脚本里）。
+        const list = disabledList(cfg);
+        if (list.length === 0) {
+          msg = "灰名单为空（无人工禁用项）";
+        } else {
+          const file = disabledModelsPath(cfg);
+          msg = [
+            `灰名单 ${list.length} 条（真源：${file}）`,
+            `  ${list.join(", ")}`,
+            "",
+            "恢复巡检：用本仓的巡检脚本探活（与健康闸同一套判定语义）",
+            "  · reviewAt 到点 ⇒ 探测；未到点 ⇒ 自动忽略（零请求）",
+            "  · reviewAt=null ⇒ 视为可随时复检",
+            "  · 只给建议，不自动改文件（半人工核实）",
+            "",
+            "可用 /router grey-list 只看时点状态（不探测）。",
+          ].join("\n");
+        }
+      } else if (sub === "grey-list") {
+        // 只列时点状态，不探测（零网络请求）——便于随时查看「哪些到点了」。
+        const file = disabledModelsPath(cfg);
+        const entries = disabledEntries(cfg);
+        if (entries.length === 0) {
+          msg = `灰名单为空（${file}）`;
+        } else {
+          const now = Date.now();
+          const rows = entries.map((e) => {
+            const ra = e.reviewAt ? Date.parse(e.reviewAt) : NaN;
+            const state = !e.reviewAt || Number.isNaN(ra) ? "待复检" : ra <= now ? "待复检" : "未到点";
+            return `  [${state}] ${e.id}${e.reviewAt ? ` reviewAt=${e.reviewAt}` : "（无时点）"}${e.reason ? `  ${e.reason}` : ""}`;
+          });
+          msg = [`灰名单 ${entries.length} 条（${file}）`, ...rows].join("\n");
+        }
       } else if (sub === "version") {
         msg = `model-router v${pkgVersion()}`;
       } else if (sub === "shadow") {
@@ -1637,8 +1864,25 @@ export default function (pi: ExtensionAPI) {
           `候选池: Fast[${cfg.pool.Fast.length}] Balanced[${cfg.pool.Balanced.length}] Performance[${cfg.pool.Performance.length}]`,
           `failover/轮转: 首选 ${cfg.failover.primary} / 备选 ${cfg.failover.fallback}（池序后继兑底）${cooling ? ` | 冷却中: ${cooling}` : ""}`,
           `错误反馈(P2-1): ${errCooling || "无"}`,
+          `灰色(人工禁用): ${(() => {
+            const l = disabledList(cfg);
+            return l.length ? `${l.length} 条（${l.join(", ")}）— 候选链已剔除，/router grey-list 看时点` : "无";
+          })()}`,
+          `熔断(渠道级): ${(() => {
+            const tripped = (cfg.channels ?? []).filter((ch: string) => isChannelTripped(ch, cfg));
+            return tripped.length ? `冷却中 ${tripped.join(", ")}` : "无";
+          })()}`,
+          `排除表(永久): ${(() => {
+            try {
+              const doc = JSON.parse(readFileSync(join(dirname(disabledModelsPath(cfg)), "free-exclusions.json"), "utf8")) as { exclusions?: Record<string, unknown> };
+              const n = Object.keys(doc.exclusions ?? {}).length;
+              return `${n} 条（provider 下架等，见 free-exclusions.json）`;
+            } catch {
+              return "（读取失败）";
+            }
+          })()}`,
           `outcome(P2-4): 回合 ${outcomes.turns} | 错误回合 ${outcomes.retriedTurns} | 模型级限流 ${outcomes.modelErrors} | 泳道 code/knowledge/general ${outcomes.laneCount.code}/${outcomes.laneCount.knowledge}/${outcomes.laneCount.general}`,
-          `用法: /router auto | /router manual [modelId] | /router shadow | /router active | /router stats | /router version（v${pkgVersion()}）`,
+          `用法: /router auto | /router manual [modelId] | /router shadow | /router active | /router stats | /router grey | /router grey-list | /router version（v${pkgVersion()}）`,
           `（决策明细: ${LOG_PATH}；回合 outcome: ${OUTCOME_LOG_PATH}）`,
         ].join("\n");
       }
