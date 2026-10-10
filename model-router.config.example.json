@@ -8,6 +8,10 @@
   },
   "timeGate": { "model": "", "startHour": 23, "endHour": 8 },
   "health": { "url": "", "timeoutMs": 600, "ttlSec": 60 },
+  "pricing": {
+    "file": "",
+    "freeModels": []
+  },
   "channels": ["your-provider"],
   "failover": {
     "enabled": true,
@@ -28,6 +32,11 @@
   "thinkingTier": {
     "enabled": true,
     "byTier": { "Fast": "minimal", "Balanced": "medium", "Performance": "high" }
+  },
+  "thinkingCost": {
+    "enabled": true,
+    "freeMax": "minimal",
+    "paid": "off"
   },
   "costGuard": {
     "enabled": true,

@@ -209,7 +209,7 @@ check("D4. 通配不误伤前缀相似渠道（ch-beta vs ch-gamma）", () => {
 
 check("D5. 混合清单（精确 + 通配）均生效", () => {
   const c = { disabledModels: ["ch-alpha/*", "ch-delta/model-d"] };
-  assert.equal(isDisabled("ch-alpha/qwen3.8-flash", c), true);
+  assert.equal(isDisabled("ch-alpha/some-model", c), true);
   assert.equal(isDisabled("ch-delta/model-d", c), true);
   assert.equal(isDisabled("ch-delta/model-g", c), false);
 });

@@ -2,6 +2,55 @@
 
 Notable changes, newest first.
 
+## v0.16.1
+
+- **The cost axis now needs cost data before it fires.** `thinkingCost` (v0.16.0) treated *every*
+  model it could not identify as paid, which quietly merged two different situations: "this model is
+  paid" and "I have no pricing information at all". With the shipped defaults — `pricing.file` empty,
+  no `MODEL_ROUTER_PRICING` — the second case is the normal case, so the first release of the cost
+  axis turned reasoning **off for every model** on a default install. Configuration absence is not a
+  spending decision, so the axis now engages only when a cost source is actually readable
+  (`costKnowledge().available`: a non-empty `pricing.freeModels`, or a pricing file that parses) and
+  otherwise falls back to the tier axis — a default install behaves exactly like v0.13.0. As soon as
+  cost data *is* available the conservative rule is unchanged: an unlisted model is still treated as
+  paid (→ `off`). Implementation note: the free set and the availability flag are computed by one
+  cached call (`costKnowledge`), so the two can never come from different snapshots; `freeSet`
+  became a thin wrapper, leaving tier-free ordering and the cost guard byte-for-byte unchanged.
+- **Removed internal-only references.** A stale reference to a private repository's gate numbering and
+  several pointers to an internal design document (plus a machine-local timezone assumption) were
+  dropped from comments, so the published sources describe only this repository.
+
+## v0.16.0
+
+- **Thinking levels now follow cost, not just tier.** The router applies a thinking level itself:
+  free models are capped at `minimal`, paid models default to **off**. The per-tier map
+  (`thinkingTier.byTier`: `Fast=minimal`, `Balanced=medium`, `Performance=high`) is kept as a
+  **ceiling** and the new `thinkingCost` block supplies the second axis; the applied level is the
+  **stricter of the two** (`off < minimal < low < medium < high < xhigh < max`). Keeping `byTier`
+  rather than replacing it means re-enabling reasoning for paid models later is a two-value config
+  edit — and `thinkingCost.enabled=false` rolls back to pure v0.13.0 behaviour without a code change.
+  Paid models get `off` with no flagship exception: a stronger tier does not imply deeper reasoning
+  when the tier was chosen for cost reasons in the first place.
+- **Applied where a "default" has to mean something.** Levels were only applied after the extension
+  switched models itself, so on a day without a single switch no level was applied at all and neither
+  the startup model nor a manual `/model` choice was covered. Levels are now also applied on
+  `session_start` and `model_select`. Both paths are idempotent (an unchanged level is not rewritten),
+  a switch initiated by the router is not applied twice, and each effective write appends one
+  `thinking_default` record to the decision log. The cost is deliberate and now documented: a
+  per-model level remembered by the host for a previous session is overwritten when that model is
+  selected — the stable exemption remains an explicit `settings.modelThinkingLevels` entry, and a
+  later manual `/thinking` is never revisited.
+- **Free/paid is judged from one source.** The cost axis reuses the same free set as the cost guard
+  (a pricing table's `rate: 0` rows plus an explicit list), rather than inventing a second definition,
+  and accepts both the pool form and the resolved `provider/id` form so a lookup cannot miss on a
+  spelling difference.
+- **`tools/thinking_cost_selftest.mjs`** — 58 assertions covering the truth table (cost × tier),
+  the data-source and conservatism rules, the application and exemption paths, the rollback levers,
+  and the form helpers. It imports the extension's real named exports and drives the actual
+  `session_start` / `model_select` handler bodies through a recording fake API, so "pure functions
+  green but the hook never calls them" cannot pass unnoticed. Run it with a node that can strip
+  TypeScript types (`node --experimental-strip-types tools/thinking_cost_selftest.mjs`, node ≥ 22).
+
 ## v0.15.0
 
 - **Channel-level circuit breaker.** A model-level cooldown only cools the single model that was

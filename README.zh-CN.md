@@ -90,11 +90,18 @@ classify()  ── 规则分层分类器：Fast / Balanced / Performance
   并**结束本回合**，把问题交还给人。由于升档每回合至多一次，没有这一层时，升完那一级后再
   连败就只剩 agent 硬试而无人知晓。`graceAfterUpgradeSec` 保证刚升过档的模型在证明自己之前
   不会被立即判弃。
-- **档位→思考等级** —— `Fast` → `minimal`、`Balanced` → `medium`、`Performance` → `high`。
-  只在**本扩展自己切模型**时施加，故手动 `/thinking` 永不被打断；settings 中针对具体模型的
-  `modelThinkingLevels` 显式配置优先级更高。该配置的键是**解析后**的 `provider/modelId`，不是池项
-  写法：若池内写的是 `my-gateway/gpt-x`，而 pi 把它解析到 provider `myprovider` 之下，则键为
-  `myprovider/my-gateway/gpt-x`；用池项写法作键会静默匹配不上。
+- **思考等级：两轴取较严者** —— 免费模型封顶 `minimal`，收费模型默认 **off**；档位映射
+  （`Fast` → `minimal`、`Balanced` → `medium`、`Performance` → `high`）降为**上限**，最终施加
+  的是两轴中较严的一个（`off < minimal < low < medium < high < xhigh < max`）。收费一律 off，
+  旗舰无例外。免费/收费的判定源与成本护栏 `freeFirst` **同一套**集合；**且仅在该数据可读时
+  成本轴才生效**（`pricing.freeModels` 非空，或定价表可解析）——未配成本源时行为等同纯档位上限，
+  故默认安装不受影响；`thinkingCost.enabled=false` 可退回纯档位行为。施加面＝router 自切 +
+  `session_start` + `model_select`（两条 hook 幂等），故起手模型与手动 `/model` 同样被覆盖。
+  手动 `/thinking` 永不被打断；settings 中针对具体模型的 `modelThinkingLevels` 显式配置优先级最高。
+  该配置的键是**解析后**的 `provider/modelId`，不是池项写法：若池内写的是 `my-gateway/gpt-x`，
+  而 pi 把它解析到 provider `myprovider` 之下，则键为 `myprovider/my-gateway/gpt-x`；用池项写法
+  作键会静默匹配不上。**代价须知**：由于在「模型被选定」时施加，宿主为该模型记住的历史等级会被
+  覆写——需要保留的模型请在 `modelThinkingLevels` 中钉住。
 - **成本护栏** —— 两道规则，阻止自动切档在无人知晓的情况下花钱。免费/收费的判定源与
   `freeFirst` **同一套**集合（定价表中 `rate == 0` 的行 ∪ 显式 `pricing.freeModels` 清单）；
   表中查不到的模型按**收费**处理（保守口径）。
@@ -194,7 +201,8 @@ pi install ~/pi-packages/model-router
 | `midThread` | `{ enabled: true, failThreshold: 3, cooldownSec: 60 }` | 连续工具失败 → 升一档 |
 | `subagentTier` | `{ enabled: true }` | `subagent` 任务独立分档 |
 | `attemptBudget` | `{ enabled: true, giveUpAfter: 5, notify: true, stopTurn: true, graceAfterUpgradeSec: 30 }` | 连续工具失败达阈值 → 记录、提示并结束本回合（ask-for-help）。`giveUpAfter` 应**大于** `midThread.failThreshold`，以保证先尝试升档 |
-| `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | 本扩展切模型后施加的思考等级（`minimal` / `low` / `medium` / `high` / `xhigh` / `max`）。手动 `/thinking` 或 `modelThinkingLevels` 显式配置优先 |
+| `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | 档位思考等级，现为两轴的**上限**（`minimal` / `low` / `medium` / `high` / `xhigh` / `max`）。手动 `/thinking` 或 `modelThinkingLevels` 显式配置优先 |
+| `thinkingCost` | `{ enabled: true, freeMax: "minimal", paid: "off" }` | 成本轴：免费封顶 `freeMax`、收费默认 `paid`（旗舰无例外）；与档位轴取较严者，施加于自切 + `session_start` + `model_select`。**仅在成本数据可读时生效**（`pricing.freeModels` 非空或定价表可解析）；`enabled: false` 退回纯档位行为 |
 | `costGuard` | `{ enabled: true, shortPromptChars: 200, confirmUpgradeTiers: ["Performance"], confirmTimeoutSec: 120 }` | 同档内免费优先（极短 prompt 除外）；付费升入 `confirmUpgradeTiers` 前先征询。拒绝 / 超时 / 无 UI ⇒ 留在当前档 |
 | `errorFeedback.*` | 见源码 | 限流冷却 + 近期错误窗口（`recentErrorRateThreshold: 0.34`）|
 | `channelBreaker` | `{ enabled: true, windowSec: 900, failThreshold: 3, cooldownSec: 900 }` | 渠道级熔断：同一渠道在 `windowSec` 内失败达 `failThreshold` ⇒ 冷却**整渠道** `cooldownSec`。补的是「渠道上游挂掉、而账号级健康闸仍报 `ok`」这一盲区 |
@@ -285,6 +293,7 @@ model-router/
 ├── tools/router_calibrate.py        # 离线只读校准报告（python3 标准库）
 ├── tools/scan_grey_models.py        # 灰名单恢复巡检（只读，python3 标准库）
 ├── tools/channel_breaker_selftest.mjs # 渠道熔断 + 灰名单真值表自测（node）
+├── tools/thinking_cost_selftest.mjs   # 思考等级真值表 + 真实 hook 路径自测（node ≥ 22）
 ├── model-router.config.example.json # 复制为 ~/.pi/agent/model-router.config.json
 ├── disabled-models.json             # 灰名单（模板）
 ├── free-exclusions.json             # 可选的免费模型覆盖契约（见下）
@@ -371,6 +380,7 @@ python3 tools/scan_grey_models.py --self-test # 时点判定真值表（零网�
 ## 校准工作流
 
 ```bash
+node --experimental-strip-types tools/thinking_cost_selftest.mjs   # 思考等级 58 条判据
 python3 tools/router_calibrate.py             # 全量报告
 python3 tools/router_calibrate.py --days 7    # 仅最近一周
 python3 tools/router_calibrate.py --min-n 50  # 更严格的样本下限

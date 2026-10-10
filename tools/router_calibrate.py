@@ -240,7 +240,7 @@ def main() -> int:
         print(f"     {OKMARK} 无非预期项（或样本不足，尚不足以给结论）")
     print()
     print("  提示：本报告**只读不改**。据建议修改 pi-agent/packages/model-router/extensions/")
-    print("        model-router.ts 的 DEFAULTS 常量（池序/分档），改后跑门禁 §3.20/§3.21。")
+    print("        model-router.ts 的 DEFAULTS 常量（池序/分档），改后请自行跑一次真实会话验证。")
     return 0
 
 

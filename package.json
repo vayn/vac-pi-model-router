@@ -1,7 +1,7 @@
 {
   "name": "pi-model-router",
-  "version": "0.15.0",
-  "description": "Two-gear model router for the pi coding agent: rule-based tier classification with 3-level health gates, error feedback, channel-level circuit breaker, mid-thread upgrades, an attempt budget (ask-for-help), per-tier thinking levels, sub-agent tiering, a cost guard, and a manual disable-list (grey models); manual lock always wins.",
+  "version": "0.16.1",
+  "description": "Two-gear model router for the pi coding agent: rule-based tier classification with 3-level health gates, error feedback, channel-level circuit breaker, mid-thread upgrades, an attempt budget (ask-for-help), two-axis thinking levels (per-tier ceiling × cost axis: free capped at minimal, paid off), sub-agent tiering, a cost guard, and a manual disable-list (grey models); manual lock always wins.",
   "keywords": [
     "pi-package",
     "pi-extension",

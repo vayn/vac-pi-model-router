@@ -26,8 +26,12 @@
  *     （起点分类误判），升 1 级（每回合至多 1 次 + 冷却）；成功即归零（连续性才是难度信号）
  *   · 尝试预算——连续失败 ≥ attemptBudget.giveUpAfter ⇒ 承认卡住：记录 + 提示 + **结束本回合**
  *     交还人（ask-for-help）。与升档共用同一信号、同一 handler，按序执行：先升档，升不动才判弃
- *   · 档位→思考等级——本扩展自切模型后施加 thinkingTier.byTier（Fast=minimal/Balanced=medium/
- *     Performance=high）；手动 /thinking 与 settings.modelThinkingLevels 显式配置优先，不覆盖用户意图
+ *   · 思考等级＝**两轴取较严者**（v0.16.0 起）：档位轴 thinkingTier.byTier（Fast=minimal/
+ *     Balanced=medium/Performance=high，现降为**上限**）× 成本轴 thinkingCost（免费封顶 minimal、
+ *     收费 off，无例外）；**成本轴需有成本数据才生效**（v0.16.1：显式清单非空或定价表可读，
+ *     否则退回档位轴——无数据≠全收费）。施加于本扩展自切模型后，以及 session_start /
+ *     model_select（即“默认”语义覆盖起手与手动选定）；手动 /thinking 与
+ *     settings.modelThinkingLevels 显式配置优先，不覆盖用户意图
  *   · 子代理自动分档——subagent 工具按 task 文本独立分档，注入该档锚位
  *     （显式 model 不覆盖；workflow/chain 多子代理不强插）
  *   · 同回合重发——模型级限流且轮转成功后，重放原 prompt（每回合至多 1 次 + 节流）
@@ -64,12 +68,32 @@ const LEGACY_LOG_PATH = join(STATE_DIR, "shadow-log.jsonl"); // Phase 0 旧日�
 // 无界文件对「审计可查性」与备份/传输不利，故设 8MB 上限：
 // 超限即原子改名轮转一份 .1（仅保留一代，避免无限膨胀）。
 const LOG_MAX_BYTES = 8 * 1024 * 1024;
-// 健康探测用的网关鉴权配置（JSON 含 api_key）——经环境变量注入，代码不内置本机路径。
+// 健康探测用的网关鉴权配置（JSON 含 api_key）——经环境变量注入，代码不内置任何本机路径。
 const GATEWAY_CONFIG = process.env.MODEL_ROUTER_GATEWAY_CONFIG ?? "";
 // 定价表缓存 TTL（免费判定）；数据源变化时另有指纹分键立即失效，故此值只兜「文件内容变更」。
 // 注：路径常量一律在函数体内读 process.env——模块级常量的可见性在扩展加载后不保证
 //（实测 before_agent_start 报 ReferenceError），故此处只放纯数值常量。
 const PRICING_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * 思考等级枚举（本地声明；pi 未从包根导出该类型，故同形声明一份）。
+ * 上游权威：`@earendil-works/pi-agent-core` 的 `ThinkingLevel`
+ *   = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+ * （枚举扩展时两处均需改；扩展无编译期检查，只能靠运行时暴露。）
+ */
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** 严→宽排序（off 最严 = 不推理）。用于两轴「取较严者」。 */
+const THINK_ORDER: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** 取较严者：不在排序内的值一律当作「更宽」处理（宁可因未知值而少改动，不可误抬）。 */
+function stricterLevel(a: ThinkingLevel, b: ThinkingLevel): ThinkingLevel {
+  const ia = THINK_ORDER.indexOf(a);
+  const ib = THINK_ORDER.indexOf(b);
+  if (ia < 0) return b;
+  if (ib < 0) return a;
+  return ia <= ib ? a : b;
+}
 
 
 
@@ -118,7 +142,7 @@ const DEFAULTS = {
     knowledge: [],
   },
   // P2-1 错误反馈：模型级限流短窗冷却（/status 健康闸盲区补偿）；6004 解析文案中的重置时刻
-  // Phase 3 深化（v0.11.0，报告 §七）：
+  // Phase 3 深化（v0.11.0）：
   // ① mid-thread 升档——回合内连续工具失败 ≥ 阈值 ⇒ 任务实为 hard/agentic（起点分类误判），升 1 级
   midThread: { enabled: true, failThreshold: 3, cooldownSec: 60 },
   // ② 子代理自动分档——subagent 工具按 task 文本独立分档注入 model（显式 model 不覆盖）
@@ -132,8 +156,9 @@ const DEFAULTS = {
   //    等于把「升档重试」和「放弃」压成同一个动作。
   attemptBudget: { enabled: true, giveUpAfter: 5, notify: true, stopTurn: true, graceAfterUpgradeSec: 30 },
   // ④ 档位→思考等级映射（v0.13.0）：简单活少想、难活多想。
-  //    只在本扩展**自己切换模型**时施加（不劫持用户手动 /thinking 的意志），
-  //    且当 settings.modelThinkingLevels 对目标模型有显式配置时让位于该配置（用户显式意图优先）。
+  //    v0.16.0 起本块**降为上限**，与成本轴取较严者（见 ④b）；施加面亦从「仅自切」扩到
+  //    session_start + model_select。不劫持用户手动 /thinking；当 settings.modelThinkingLevels
+  //    对目标模型有显式配置时让位于该配置（用户显式意图优先）。
   //    未支持 reasoning 的模型由 pi 自行 clamp，无需本扩展判断。
   thinkingTier: {
     enabled: true,
@@ -141,8 +166,26 @@ const DEFAULTS = {
     // 定义，在 DEFAULTS 字面量内引用会构成循环定义。
     byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } as Record<
       string,
-      "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+      ThinkingLevel
     >,
+  },
+  // ④b 成本轴→思考等级（v0.16.0）：免费模型思考等级**封顶** freeMax，收费模型**默认关闭**推理 paid
+  //   （旗舰无例外——高档位不代表必须深思考，收费侧一律从省 token 出发）。
+  //   【与档位轴的关系】取较严者（min by THINK_ORDER），故本规则天然覆盖 ④ 的档位语义：
+  //     收费 Balanced(min(medium,off)=off) / 收费 Performance(min(high,off)=off) /
+  //     免费 Fast(min(minimal,minimal)=minimal) / 免费 Balanced(min(medium,minimal)=minimal)。
+  //     为何不删 byTier：删了以后想放开付费推理就得重写映射；留着只调本块即可（单一真相 + 可回退）。
+  //   【免费判定源】freeSet＝定价表 rate=0 ∪ 显式免费清单——与成本护栏 isPaid 同一真相，
+  //     不另立第二套「免费」定义（DRY）。查不到条目 ⇒ 按收费处理（保守：宁可不给推理也不误烧钱）。
+  //   【生效前置（v0.16.1）】**须有成本数据**（costDataAvailable）：显式清单非空，或定价表可读可解析。
+  //     无数据 ⇒ 成本轴不生效、退回档位轴。理由：把「判不出」当「全收费」，会让未配成本源的部署
+  //     （如本扩展的默认配置：pricing.file 空、无环境变量）全体等级被静默置 off——那是配置缺失，
+  //     不是任何人的裁定。这也是**默认配置开箱可用**的前提：没配定价表时行为等同 v0.13.0。
+  //   【回退面】enabled=false ⇒ 完全退回 v0.13.0 纯档位行为（不改代码即可回滚）。
+  thinkingCost: {
+    enabled: true,
+    freeMax: "minimal" as ThinkingLevel,
+    paid: "off" as ThinkingLevel,
   },
   // ⑤ 成本护栏（v0.14.0）——自动挡切到收费模型前的「免费优先 + 升档确认」两道闸：
   //   【规则一：同档有可用免费候选就别切收费】当真要切到的目标模型收费、而**同档内存在可用
@@ -371,10 +414,15 @@ function resolveModel(
 
 // 缓存按「数据源指纹」分键：配置或文件变化时立即失效，避免 5 分钟 TTL 内沿用旧判定
 // （例如定价表被删除后若仍用缓存，会把已转付费的模型继续当免费）。
-let pricingCache: { key: string; at: number; free: Set<string> } | null = null;
+// 【available（v0.16.1）】区分两件常被混淆的事：
+//   · 「判为收费」＝**有**成本数据、但该模型不在其中 ⇒ 保守按收费（花钱侧不冒险）；
+//   · 「判不出」＝**无**成本数据（未配显式清单、定价表未配或不可读）⇒ 无从判断。
+//     若把后者当「全收费」，则未配成本源的部署会被静默把全体思考等级置 off——那是配置缺失，
+//     不是任何人的裁定。故思考等级的成本轴只在 available 时生效（见 desiredThinkingLevel）。
+let pricingCache: { key: string; at: number; free: Set<string>; available: boolean } | null = null;
 
-/** 免费模型集合 ＝ 定价表（rate=0）∪ 显式免费清单。数据源缺失 ⇒ 空集 ⇒ 上层返回原序。 */
-function freeSet(c: Cfg): Set<string> {
+/** 成本知识：免费集合 + 是否有成本数据。两者必须同源同缓存（否则可能取自不同快照）。 */
+function costKnowledge(c: Cfg): { free: Set<string>; available: boolean } {
   // ① 显式清单（无定价表部署的主要形式）
   const list = c.pricing?.freeModels ?? [];
 
@@ -384,10 +432,12 @@ function freeSet(c: Cfg): Set<string> {
   const key = JSON.stringify([list, file]);
   const now = Date.now();
   if (pricingCache && pricingCache.key === key && now - pricingCache.at < PRICING_TTL_MS) {
-    return pricingCache.free;
+    return pricingCache;
   }
   const free = new Set<string>();
   for (const m of list) if (typeof m === "string" && m) free.add(m);
+  // 「有成本数据」＝显式清单非空，**或**定价表可读且可解析（读到表即可，哪怕零条免费也是数据）
+  let available = free.size > 0;
 
   if (file) {
     try {
@@ -398,13 +448,24 @@ function freeSet(c: Cfg): Set<string> {
         if (typeof row.model !== "string") continue;
         if (row.rate === 0) free.add(`${String(row.channel ?? "")}/${row.model}`);
       }
+      available = true;
     } catch {
-      /* 读失败 ⇒ 仅保留显式清单；绝不阻断会话 */
+      /* 读失败 ⇒ available 取决于显式清单；绝不阻断会话 */
     }
   }
 
-  pricingCache = { key, at: now, free };
-  return free;
+  pricingCache = { key, at: now, free, available };
+  return pricingCache;
+}
+
+/** 免费模型集合 ＝ 定价表（rate=0）∪ 显式免费清单。数据源缺失 ⇒ 空集 ⇒ 上层返回原序。 */
+function freeSet(c: Cfg): Set<string> {
+  return costKnowledge(c).free;
+}
+
+/** 是否**有**成本数据可判（v0.16.1）：显式清单非空，或定价表可读且可解析。 */
+function costDataAvailable(c: Cfg): boolean {
+  return costKnowledge(c).available;
 }
 
 function freeFirst(models: string[], c: Cfg): string[] {
@@ -567,7 +628,7 @@ function isErrorCooling(modelId: string): boolean {
 //   第三级补 **频次维度**：读 outcome-log.jsonl（v0.9.0 起的回合级真实 outcome），
 //   统计每个模型在最近 window 内的错误率，超阈值者在决策时降权（不删出池——保留为末位逃生）。
 // 【为什么读 outcome-log 而不另建状态文件】单一数据源（DRY），且它是**已持久化的真实 outcome**，
-//   正合报告 §七 Phase 3「近期错误反馈感知」原意；新增状态文件只会造成又一处待同步的真相。
+//   正合 Phase 3「近期错误反馈感知」原意；新增状态文件只会造成又一处待同步的真相。
 interface RecentErrStats {
   samples: number;
   errors: number;
@@ -629,13 +690,13 @@ function classifyModelError(msg: string, c: Cfg): { window: ErrorWindow; kind: s
   const text = String(msg ?? "");
   // ①窗口型带 body：中文「您的使用量已超出频率限制，将在 <时刻> 重置」与英文
   //   「usage exceeds frequency limit ... will reset at <时刻> UTC+8」同语义（DRY，中英同列）。
-  //   v0.10.1 修复：原正则只匹配中文形态，英文 6004（dp4.1 实弹 07:33 撞窗实测）漏判 ⇒
+  //   v0.10.1 修复：原正则只匹配中文形态，英文 6004（实弹撞窗）漏判 ⇒
   //   冷却窗丢失，同模型在重置前被反复尝试（每次撞窗 = 浪费一回合）。
   const m6004 = text.match(/(使用量|用量|usage\s+exceeds?\s+frequency|usage\s+limit).*?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/);
   if (m6004) {
     const reset = Date.parse(m6004[2].replace(" ", "T"));
     let until = Number.isNaN(reset) ? 0 : reset;
-    // 网关报 UTC+8 时刻；Date.parse 无时区后缀按本地时区解析，本机 = Asia/Shanghai(+8) ⇒ 等价。
+    // 网关报 UTC+8 时刻；Date.parse 无时区后缀按本地时区解析，本地非 UTC+8 时需自行换算。
     // 上限放宽到 24h（usageWindowMaxSec=12h 是窗口长度先验，重置时刻可能略超）
     if (!until || until - Date.now() > c.errorFeedback.usageWindowMaxSec * 2 * 1000) {
       until = Date.now() + c.errorFeedback.usageWindowMaxSec * 1000;
@@ -713,7 +774,7 @@ let gaveUpThisTurn = false;
 
 // ---------- P2-4 后半：回合级 outcome 落盘（校准分类器的数据基础） ----------
 // 【动因】原 outcomes 仅**进程内计数**（/router stats），进程退出即失；且决策日志无 outcome 字段
-//   ⇒ 无法回答「某档/某模型实际成功率多少」，分类器只能纯规则打分（报告 §十一 自述「校准未完成期」）。
+//   ⇒ 无法回答「某档/某模型实际成功率多少」，分类器只能纯规则打分 自述「校准未完成期」）。
 // 【设计】回合边界（agent_end）落一条 outcome 记录，用 decisionId 关联当回合的决策记录。
 //   只记**可从事件直接观测**的信号，不做质量启发式推断（噪声大，待数据验证后再议）：
 //     turnResult   ok | error          本回合是否出现过 assistant stopReason=error
@@ -1184,7 +1245,7 @@ function rotationTarget(curId: string, c: Cfg): { to: string | null; crossTier: 
 
 // ---------- 审计日志 ----------
 
-// ── Phase 3 ①：mid-thread 升档（报告 §七）──
+// ── Phase 3 ①：mid-thread 升档 ──
 // 第一性原理：分类器只看回合起点的 prompt 文本，而任务真实难度在执行中暴露——
 // 规划段像 easy/Fast 的任务，连续撞工具失败即实为 agentic/hard。负反馈若不打破：
 // 弱档 → 更多失败 → 继续弱档。设计：
@@ -1217,20 +1278,57 @@ function attemptBudgetExhausted(c: Cfg): boolean {
   return true;
 }
 
-// ── 档位→思考等级 ──
-// 语义边界（三条，均「不覆盖用户意图」）：
-//   ① 只在本扩展自己切模型后调用（用户 /thinking 手动设定不经过这里）；
-//   ② settings.modelThinkingLevels 对该模型有显式配置 ⇒ 让位；
-//   ③ 已是目标等级 ⇒ 不重复设置。
-// 返回施加的等级（未施加则 null），供决策日志留痕。
+// ── Phase 4（v0.13.0）→ v0.16.0：思考等级＝两轴取较严者（档位轴 × 成本轴）──
+// 【施加时机】本扩展**自己切换模型**后、以及 session_start / model_select。
+// 【用户显式配置优先】settings.modelThinkingLevels 对目标模型有配置 ⇒ 让位（用户显式意图 > 默认值）。
+// 【不自行判断模型能力】pi 的 setThinkingLevel 已按模型能力 clamp（不支持 reasoning 的模型降到 off）。
 // 【键口径】modelId 必须是**解析后模型**的 `${provider}/${id}`（即 settings.modelThinkingLevels 的键），
 //   而不是池项写法 `<channel>/<model>`——二者通常不同（池项前缀是网关渠道名，
 //   解析后的 provider 是 pi 的注册 provider 名）。传池项写法会**永远查不中**用户配置
 //   ⇒ 静默覆盖用户显式意图。这层「用户显式配置优先」的保证即因此失效。
-function applyThinkingTier(pi: ExtensionAPI, modelId: string, tier: Tier, c: Cfg): string | null {
+
+/**
+ * 解析后 `${provider}/${id}` → 定价表/池项写法（剩掉 provider 段）。
+ * 经统一网关时，网关通常把池项写法当作 model.id 下发，故剩一段即回到 `<channel>/<model>`；
+ * 第三方直连模型剩出来是裸 id，定价表查不到 ⇒ 按收费处理（与 isPaid 的保守口径一致）。
+ * 【为何不逐个调用点传池项写法】各调用点手边形态不一，统一从解析后形态回推可避免
+ * 第四种「传错口径」。
+ */
+function poolIdOf(parsedId: string): string {
+  const i = parsedId.indexOf("/");
+  return i >= 0 ? parsedId.slice(i + 1) : parsedId;
+}
+
+/** 成本轴的免费判定：池项写法 ∪ 解析后写法，任一命中定价表即算免费。
+ *  仅在**有成本数据**时调用（costDataAvailable 为真）；数据在位但查不到该模型
+ *  ⇒ 按收费处理（保守：宁可不给推理，也不误烧钱）。 */
+function isFreeInPricing(poolId: string, parsedId: string, c: Cfg): boolean {
+  const free = freeSet(c);
+  if (free.size === 0) return false;
+  return free.has(poolId) || free.has(parsedId);
+}
+
+/**
+ * 期望思考等级＝两轴取较严者（v0.16.0 核心规则，纯函数便于单测）。
+ *  · 档位轴：byTier[tier]（v0.13.0 遗产，现为上限）；越池模型（tier=null）无档位上限。
+ *  · 成本轴：免费 ⇒ freeMax（封顶）；收费 ⇒ paid（=off，无例外）。
+ *  · 成本轴 disabled ⇒ 完全退回 v0.13.0 纯档位行为（回退面）。
+ *  · **无成本数据 ⇒ 成本轴不生效**（v0.16.1）：显式清单空、定价表未配或不可读时
+ *    无从判免费/收费 ⇒ 直接返回档位轴，而不是把「无数据」当「全收费」把等级一律压 off。
+ *    「判不出」与「判为收费」必须分开：前者是配置缺失，后者才是花钱判断。
+ */
+function desiredThinkingLevel(parsedId: string, tier: Tier | null, c: Cfg): ThinkingLevel | null {
   const tt = c.thinkingTier;
-  if (!tt?.enabled) return null;
-  const want = tt.byTier?.[tier];
+  const tierLevel = tt?.enabled && tier ? tt.byTier?.[tier] ?? null : null;
+  const tc = c.thinkingCost;
+  if (!tc?.enabled) return tierLevel;
+  if (!costDataAvailable(c)) return tierLevel;
+  const costLevel: ThinkingLevel = isFreeInPricing(poolIdOf(parsedId), parsedId, c) ? tc.freeMax : tc.paid;
+  return tierLevel ? stricterLevel(tierLevel, costLevel) : costLevel;
+}
+
+function applyThinkingTier(pi: ExtensionAPI, modelId: string, tier: Tier | null, c: Cfg): ThinkingLevel | null {
+  const want = desiredThinkingLevel(modelId, tier, c);
   if (!want) return null;
   try {
     const explicit = pi.getSettings()?.modelThinkingLevels?.[modelId];
@@ -1242,6 +1340,32 @@ function applyThinkingTier(pi: ExtensionAPI, modelId: string, tier: Tier, c: Cfg
   } catch {
     return null; // 思考等级调整失败不得阻断会话
   }
+}
+
+/**
+ * 「默认」语义的施加入口（v0.16.0）：对**当前已选定**的模型定一次思考等级。
+ * 【为何必须】「默认关闭推理 / 免费封顶 minimal」的语义必须覆盖起手与手动选定；
+ *   只在 router 自切后施加，则一天没触发切换时全天无人施加过任何等级——“默认”名不副实。
+ * 【只在被选定时刻施加一次】之后不回头改——用户随后 /thinking 是运行期意志，一律保留。
+ * 【幂等】同一目标等级重复调用不会写两次（getThinkingLevel()===want ⇒ 直接返回 null）。
+ * 【失败不得阻断】applyThinkingTier 内部已 try/catch。
+ */
+function applyThinkingDefault(pi: ExtensionAPI, parsedId: string, c: Cfg, trigger: string): ThinkingLevel | null {
+  const tier = tierOf(poolIdOf(parsedId), c);
+  const got = applyThinkingTier(pi, parsedId, tier, c);
+  if (got !== null) {
+    appendLog({
+      ts: new Date().toISOString(),
+      type: "thinking_default",
+      trigger,
+      model: parsedId,
+      poolModel: poolIdOf(parsedId),
+      tier,
+      free: isFreeInPricing(poolIdOf(parsedId), parsedId, c),
+      thinkingLevel: got,
+    });
+  }
+  return got;
 }
 
 function appendLog(rec: Record<string, unknown>) {
@@ -1292,7 +1416,14 @@ function statsMessage(c: Cfg): string {
     `回合: ${outcomes.turns} | 含错误回合: ${outcomes.retriedTurns} | 模型级限流命中: ${outcomes.modelErrors}（错误事件累计 ${outcomes.errors}）`,
     `泳道分布: code=${outcomes.laneCount.code} knowledge=${outcomes.laneCount.knowledge} general=${outcomes.laneCount.general}`,
     `Phase 3 深化: mid-thread 升档 ${outcomes.midThreadUpgrades} 次 | 子代理分档注入 ${outcomes.subagentTiered} 次`,
-    `Phase 4: 尝试预算 ${cfg.attemptBudget?.enabled ? `开(连败${cfg.attemptBudget.giveUpAfter}次⇒停止回合)` : "关"} | 已放弃 ${outcomes.attemptsGaveUp} | 思考等级已施加 ${outcomes.thinkingApplied} | 本回合连败 ${toolFailStreak}`,
+    `Phase 4: 尝试预算 ${cfg.attemptBudget?.enabled ? `开(连败${cfg.attemptBudget.giveUpAfter}次⇒停止回合)` : "关"} | 已放弃 ${outcomes.attemptsGaveUp} | 本回合连败 ${toolFailStreak}`,
+    `思考等级（v0.16.0 两轴取较严）: 已施加 ${outcomes.thinkingApplied} 次 | 成本轴 ${
+      c.thinkingCost?.enabled
+        ? `开（免费≤${c.thinkingCost.freeMax} / 收费=${c.thinkingCost.paid}，施加于自切+session_start+model_select；${
+            costDataAvailable(c) ? "成本数据在位" : "**无成本数据⇒成本轴惰性，仅档位轴**"
+          }）`
+        : "关（仅档位轴 byTier）"
+    }`,
     `Phase 5 成本护栏: 改走免费 ${outcomes.costGuardRedirected} 次 | 升档已确认 ${outcomes.costGuardConfirmed} 次 | 升档被拒/无UI ${outcomes.costGuardDeclined} 次`,
     `错误反馈窗（P2-1）: ${errCooling || "无"}`,
     `（跨进程持久决策明细: ${LOG_PATH}；回合 outcome: ${OUTCOME_LOG_PATH}；error-state: ${ERROR_STATE_PATH}）`,
@@ -1302,7 +1433,7 @@ function statsMessage(c: Cfg): string {
 // ---------- 扩展入口 ----------
 
 export default function (pi: ExtensionAPI) {
-  pi.on("session_start", (event) => {
+  pi.on("session_start", (event, ctx) => {
     segmentSeq += 1;
     segmentReason = event.reason;
     firstOfSegment = true;
@@ -1314,13 +1445,23 @@ export default function (pi: ExtensionAPI) {
     lastRouterSwitchAt = 0;
     healthCache = null;
     cfg = loadConfig(); // 新会话重读配置文件（/router 的会话内改动仅影响本会话内存态）
+    // v0.16.0：起手即按两轴定一次默认思考等级（必须在 cfg 重读之后）。
+    // 注：本 hook 在 ctx.model 尚未就绪的 runtime 下会空转，由 model_select hook 补上（两者幂等）。
+    if (cfg.enabled) {
+      const m = ctx.model;
+      if (m) applyThinkingDefault(pi, `${m.provider}/${m.id}`, cfg, `session_start:${event.reason}`);
+    }
   });
 
   // 手动挡触发：任何非 router 的、发生在用户消息之后的模型选择
   pi.on("model_select", (event) => {
-    if (routerSwitching || Date.now() - lastRouterSwitchAt < 1000) return; // router 自动切换
-    if (!promptedOnce) return; // 启动/新会话的初始模型选择不算强制
     const id = `${event.model.provider}/${event.model.id}`;
+    const byRouter = routerSwitching || Date.now() - lastRouterSwitchAt < 1000; // router 自动切换
+    // v0.16.0：任何模型选定都定一次默认（含起手与用户手动 /model）。
+    // router 自切路径已在切后施加过，同一目标等级下本调用幂等空转（不重复写、不重复记）。
+    if (cfg.enabled && !byRouter) applyThinkingDefault(pi, id, cfg, "model_select");
+    if (byRouter) return;
+    if (!promptedOnce) return; // 启动/新会话的初始模型选择不算强制
     if (gear === "manual" && manualModel === id) return; // 重复选择同一模型
     gear = "manual";
     manualModel = id;
@@ -1488,7 +1629,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ── Phase 3 ①+②（v0.11.0）：工具调用观测（mid-thread 升档）+ 子代理自动分档（报告 §七）──
+  // ── Phase 3 ①+②（v0.11.0）：工具调用观测（mid-thread 升档）+ 子代理自动分档 ──
   pi.on("tool_call", async (event, ctx) => {
     try {
       // ② 子代理自动分档：按 task 文本独立分档，注入该档锚位模型（DRY：复用 classify）。
@@ -1892,3 +2033,19 @@ export default function (pi: ExtensionAPI) {
     },
   });
 }
+
+// ---- 测试面（具名导出）----
+// pi 只读默认导出，故这些具名导出对运行时无副作用；它们让 tools/ 下的自测**直接测真实代码**
+// 而不是另抄一份逻辑（抄一份会出现「测试全绿而真实代码是错的」）。
+export {
+  DEFAULTS,
+  THINK_ORDER,
+  stricterLevel,
+  poolIdOf,
+  isFreeInPricing,
+  desiredThinkingLevel,
+  freeSet,
+  costKnowledge,
+  costDataAvailable,
+  applyThinkingTier,
+};

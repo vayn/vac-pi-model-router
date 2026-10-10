@@ -103,12 +103,24 @@ order: try a stronger model first, and only give up when there is nothing left t
   upgrade may be spent only once per turn, without this layer a session that kept failing would
   keep failing in silence. `graceAfterUpgradeSec` stops a freshly upgraded model from being written
   off before it has had a chance to answer.
-- **Thinking level per tier** — `Fast` → `minimal`, `Balanced` → `medium`, `Performance` → `high`.
-  Applied only when this extension switched the model itself, so a manual `/thinking` is never
-  overridden, and an explicit per-model entry in `settings.modelThinkingLevels` wins over it.
-  That entry is keyed by the **resolved** `provider/modelId`, not by the pool-entry form: if your
-  pool lists `my-gateway/gpt-x` but pi resolves it under provider `myprovider`, the key is
-  `myprovider/my-gateway/gpt-x`. Using the pool form as the key silently fails to match.
+- **Thinking levels: two axes, stricter wins** — free models are capped at `minimal`, paid models
+  default to **off**, and the per-tier map (`Fast` → `minimal`, `Balanced` → `medium`,
+  `Performance` → `high`) acts as the ceiling: the applied level is the stricter of the two
+  (`off < minimal < low < medium < high < xhigh < max`). Paid means `off` with no flagship exception.
+  Free/paid comes from the same free set the cost guard uses (pricing rows with `rate: 0` plus an
+  explicit `pricing.freeModels` list), and **the axis only engages when that data is readable** —
+  with no pricing source configured, behaviour is exactly the per-tier ceiling, so a default install
+  is unaffected. Set `thinkingCost.enabled=false` to return to pure per-tier behaviour.
+  Levels are applied after a router-initiated switch **and** on `session_start` / `model_select`, so
+  the startup model and a manual `/model` are covered too (both paths are idempotent). A manual
+  `/thinking` is never overridden, and an explicit per-model entry in `settings.modelThinkingLevels`
+  wins over everything — that entry is keyed by the **resolved** `provider/modelId`, not by the
+  pool-entry form: if your pool lists `my-gateway/gpt-x` but pi resolves it under provider
+  `myprovider`, the key is `myprovider/my-gateway/gpt-x`. Using the pool form as the key silently
+  fails to match.
+  Note the deliberate trade-off: because a level is applied when a model is *selected*, a level the
+  host remembered for that model from an earlier session is overwritten. Pin such models in
+  `settings.modelThinkingLevels`.
 - **Cost guard** — two rules that stop automatic switching from spending money silently. Free/paid
   is decided by the **same** set `freeFirst` uses (pricing rows with `rate == 0` ∪ the explicit
   `pricing.freeModels` list); a model missing from the table counts as **paid** (conservative).
@@ -218,7 +230,8 @@ objects are replaced shallowly — provide the full object when overriding.
 | `midThread` | `{ enabled: true, failThreshold: 3, cooldownSec: 60 }` | Consecutive tool failures → 1-tier upgrade |
 | `subagentTier` | `{ enabled: true }` | Independent tiering of `subagent` tasks |
 | `attemptBudget` | `{ enabled: true, giveUpAfter: 5, notify: true, stopTurn: true, graceAfterUpgradeSec: 30 }` | Consecutive tool failures → record, notify and end the turn (ask-for-help). Keep `giveUpAfter` **above** `midThread.failThreshold` so upgrading is tried first |
-| `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | Thinking level applied after an extension-initiated switch (`minimal` / `low` / `medium` / `high` / `xhigh` / `max`). A manual `/thinking` or an explicit `modelThinkingLevels` entry takes precedence |
+| `thinkingTier` | `{ enabled: true, byTier: { Fast: "minimal", Balanced: "medium", Performance: "high" } }` | Per-tier thinking level, now the **ceiling** of the two axes (`minimal` / `low` / `medium` / `high` / `xhigh` / `max`). A manual `/thinking` or an explicit `modelThinkingLevels` entry takes precedence |
+| `thinkingCost` | `{ enabled: true, freeMax: "minimal", paid: "off" }` | Cost axis: free models capped at `freeMax`, paid models defaulted to `paid` (no flagship exception). Applied where the stricter of the two axes wins, on a router switch and on `session_start` / `model_select`. Engages only when cost data is readable (a non-empty `pricing.freeModels`, or a parseable pricing file); `enabled: false` restores the pure per-tier behaviour |
 | `costGuard` | `{ enabled: true, shortPromptChars: 200, confirmUpgradeTiers: ["Performance"], confirmTimeoutSec: 120 }` | Free-first inside a tier unless the prompt is ≤ `shortPromptChars`; a paid escalation into `confirmUpgradeTiers` asks first. Decline / timeout / no UI ⇒ stay in the current tier |
 | `errorFeedback.*` | see source | Rate-limit cooldowns + recent-error window (`recentErrorRateThreshold: 0.34`) |
 | `channelBreaker` | `{ enabled: true, windowSec: 900, failThreshold: 3, cooldownSec: 900 }` | Channel-level circuit breaker: `failThreshold` failures from one channel inside `windowSec` trip the **whole channel** for `cooldownSec`. Covers the gap where a channel's upstream is down while the account-level health probe still reports `ok` |
@@ -246,7 +259,8 @@ objects are replaced shallowly — provide the full object when overriding.
 /router manual [modelId] lock the current (or a named) model
 /router shadow|active    record-only ↔ real switching (session scope)
 /router stats            in-process counters: turns, errors, lane split, mid-thread upgrades,
-                         sub-agent tiering, attempts given up, thinking levels applied,
+                         sub-agent tiering, attempts given up, thinking levels applied
+                         (with the cost-axis state and whether cost data is present),
                          cost-guard redirects / confirmations / declines
 /router grey             disable-list summary + how to run the recovery inspector
 /router grey-list        time-gate status of every disable-list entry (no network requests)
@@ -316,6 +330,7 @@ model-router/
 ├── tools/router_calibrate.py        # offline read-only calibration report (python3 stdlib)
 ├── tools/scan_grey_models.py        # disable-list recovery inspector (read-only, python3 stdlib)
 ├── tools/channel_breaker_selftest.mjs # circuit-breaker + disable-list truth tables (node)
+├── tools/thinking_cost_selftest.mjs   # thinking-level truth tables + real hook paths (node ≥ 22)
 ├── model-router.config.example.json # copy to ~/.pi/agent/model-router.config.json
 ├── disabled-models.json             # grey-model list (template; see note)
 ├── free-exclusions.json             # optional free-model coverage contract (see note)
@@ -409,6 +424,7 @@ avoids. The machine gathers evidence; a human makes the call.
 ## Calibration workflow
 
 ```bash
+node --experimental-strip-types tools/thinking_cost_selftest.mjs   # 58 thinking-level assertions
 python3 tools/router_calibrate.py             # full report
 python3 tools/router_calibrate.py --days 7    # last week only
 python3 tools/router_calibrate.py --min-n 50  # stricter sample floor

@@ -272,7 +272,7 @@ def self_test() -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="灰名单恢复巡检（只读，半人工）")
-    ap.add_argument("--self-test", action="store_true", help="时点判定真值表自测（零网络，供门禁）")
+    ap.add_argument("--self-test", action="store_true", help="时点判定真值表自测（零网络，供 CI/门禁自检）")
     ap.add_argument("--file", type=Path, default=GREY_FILE, help=f"灰名单文件（默认 {GREY_FILE.name}）")
     ap.add_argument("--pool-file", type=Path, default=None,
                     help="候选池文件，每行一个 <provider>/<model>，用于展开 '渠道/*' 通配项")
